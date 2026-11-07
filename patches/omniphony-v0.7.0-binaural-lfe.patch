@@ -1,0 +1,758 @@
+diff --git a/docs/live-options-registry.md b/docs/live-options-registry.md
+index 043321e..2e7bf00 100644
+--- a/docs/live-options-registry.md
++++ b/docs/live-options-registry.md
+@@ -129,6 +129,8 @@ Declared options (`renderer::options::LIVE_OPTIONS`):
+ | `brir_tail_floor_db` | float [20, 120], step 1 | `60` | `brir` (live, reload) | — | `/control/binaural/brir/tail_floor` |
+ | `binaural_unit_scale_m` | float [0.01, 100], step 0.01 | `1` | — | — | `/control/binaural/unit_scale` |
+ | `binaural_head_radius_m` | float [0.05, 0.15], step 0.001 | `0.0875` | — | — | `/control/binaural/head_radius` |
++| `binaural_lfe_gain_db` | float [-24, 12], step 0.1 | `-3.0103` | — | — | — |
++| `binaural_lfe_lowpass_hz` | int or null [20, 500] | unset | — | — | — |
+ | `binaural_air_absorption` | bool | `true` | — | — | `/control/binaural/air_absorption` |
+ | `binaural_diffuse_field_eq` | bool | `false` | — | — | `/control/binaural/diffuse_field_eq` |
+ | `binaural_sphere_coordinates` | bool | `false` | — | — | `/control/binaural/sphere_coordinates` |
+diff --git a/docs/osc-control-contract.md b/docs/osc-control-contract.md
+index 2fe156a..7916837 100644
+--- a/docs/osc-control-contract.md
++++ b/docs/osc-control-contract.md
+@@ -487,6 +487,8 @@ dedicated address, under `/omniphony`):
+ | `brir_tail_floor_db` | float [20, 120], step 1 | `60` | `brir` (live, reload) | — | `/control/binaural/brir/tail_floor` |
+ | `binaural_unit_scale_m` | float [0.01, 100], step 0.01 | `1` | — | — | `/control/binaural/unit_scale` |
+ | `binaural_head_radius_m` | float [0.05, 0.15], step 0.001 | `0.0875` | — | — | `/control/binaural/head_radius` |
++| `binaural_lfe_gain_db` | float [-24, 12], step 0.1 | `-3.0103` | — | — | — |
++| `binaural_lfe_lowpass_hz` | int or null [20, 500] | unset | — | — | — |
+ | `binaural_air_absorption` | bool | `true` | — | — | `/control/binaural/air_absorption` |
+ | `binaural_diffuse_field_eq` | bool | `false` | — | — | `/control/binaural/diffuse_field_eq` |
+ | `binaural_sphere_coordinates` | bool | `false` | — | — | `/control/binaural/sphere_coordinates` |
+diff --git a/omniphony-renderer/renderer/src/binaural/brir_stage.rs b/omniphony-renderer/renderer/src/binaural/brir_stage.rs
+index 71ba0c2..d2a01dc 100644
+--- a/omniphony-renderer/renderer/src/binaural/brir_stage.rs
++++ b/omniphony-renderer/renderer/src/binaural/brir_stage.rs
+@@ -49,9 +49,9 @@ use std::sync::mpsc;
+ 
+ use arc_swap::ArcSwapOption;
+ 
+-use super::DIRECT_EAR_GAIN;
+ use super::brir::{BrirLoadOptions, BrirSet};
+ use super::head_pose::HeadPose;
++use super::{DirectFeed, LfeLowpass};
+ use crate::partitioned_conv::nonuniform::{NonUniformKernel, NonUniformPlan, TailStreams};
+ use crate::partitioned_conv::{InputHistory, OutputScratch};
+ 
+@@ -187,6 +187,8 @@ struct Streams {
+     taps: usize,
+     /// One head history per bus.
+     inputs: Vec<InputHistory>,
++    /// One LFE low-pass per bus, run on the direct buses.
++    lfe_lp: Vec<LfeLowpass>,
+     tails: TailStreams,
+     /// One entry per tail segment.
+     tail_banks: Vec<TailBanks>,
+@@ -198,6 +200,7 @@ impl Streams {
+         Self {
+             taps: 0,
+             inputs: Vec::new(),
++            lfe_lp: Vec::new(),
+             tails: TailStreams::empty(),
+             tail_banks: Vec::new(),
+         }
+@@ -213,6 +216,7 @@ impl Streams {
+             inputs: (0..buses)
+                 .map(|_| plan.head().make_input(capacity))
+                 .collect(),
++            lfe_lp: vec![LfeLowpass::new(); buses],
+             tails: plan.make_tails(levels, taps, buses, 2),
+             tail_banks: (1..levels)
+                 .map(|_| TailBanks {
+@@ -699,6 +703,7 @@ impl BrirStage {
+         total: usize,
+         sample_length: usize,
+         head_pose: HeadPose,
++        direct_feed: DirectFeed,
+         out: &mut [f32],
+     ) {
+         debug_assert_eq!(out.len(), 2 * sample_length);
+@@ -713,7 +718,7 @@ impl BrirStage {
+                 complete = input.push(x);
+             }
+             if complete {
+-                self.process_block(head_pose);
++                self.process_block(head_pose, direct_feed);
+             }
+             out[2 * i] += self.fifo[2 * self.read_pos];
+             out[2 * i + 1] += self.fifo[2 * self.read_pos + 1];
+@@ -725,7 +730,7 @@ impl BrirStage {
+     /// head kernels per ear, blend a landing bank swap, add the direct
+     /// buses, then let every tail segment do this block's share of its work
+     /// and add its output.
+-    fn process_block(&mut self, head_pose: HeadPose) {
++    fn process_block(&mut self, head_pose: HeadPose, direct_feed: DirectFeed) {
+         for input in &mut self.streams.inputs {
+             self.plan.head().analyze(input);
+         }
+@@ -775,12 +780,14 @@ impl BrirStage {
+         let plan = self.plan.head();
+         let Streams {
+             inputs,
++            lfe_lp,
+             tails,
+             tail_banks,
+             ..
+         } = &mut self.streams;
+         let inputs = &*inputs;
+         let bus_emitter = &self.bus_emitter;
++        let sample_rate = self.sample_rate;
+         for ear in 0..2 {
+             let scratch = &mut self.scratch[ear];
+             let out = &mut self.ear_block[ear];
+@@ -803,13 +810,21 @@ impl BrirStage {
+                 }
+                 plan.finish_blend(scratch, out);
+             }
+-            // Direct buses: the block just analysed is the one this output
+-            // block corresponds to, so no extra delay is needed.
+-            for (input, e) in inputs.iter().zip(bus_emitter) {
+-                if e.is_none() {
+-                    for (o, &x) in out.iter_mut().zip(input.last_block()) {
+-                        *o += DIRECT_EAR_GAIN * x;
+-                    }
++        }
++        // Direct buses: the block just analysed is the one this output
++        // block corresponds to, so no extra delay is needed. Each sample goes
++        // through its bus's low-pass once and into both ears.
++        let [left, right] = &mut self.ear_block;
++        for ((input, e), lp) in inputs.iter().zip(bus_emitter).zip(lfe_lp.iter_mut()) {
++            if e.is_none() {
++                for ((l, r), &x) in left
++                    .iter_mut()
++                    .zip(right.iter_mut())
++                    .zip(input.last_block())
++                {
++                    let v = direct_feed.gain * lp.process(x, direct_feed.lowpass_hz, sample_rate);
++                    *l += v;
++                    *r += v;
+                 }
+             }
+         }
+@@ -962,6 +977,7 @@ mod tests {
+     use super::test_support::{synth_set, synth_set_decay};
+     use super::*;
+     use crate::binaural::brir::BrirPair;
++    use crate::binaural::{DIRECT_EAR_GAIN, DIRECT_EAR_GAIN_DB};
+ 
+     /// The reference the ladder is held to: every tap on [`BRIR_BLOCK`]
+     /// partitions.
+@@ -1077,7 +1093,7 @@ mod tests {
+         for chunk in bus.chunks(total * sample_length) {
+             let n = chunk.len() / total;
+             let mut out = vec![0.0f32; 2 * n];
+-            stage.render_frame(chunk, total, n, head, &mut out);
++            stage.render_frame(chunk, total, n, head, DirectFeed::default(), &mut out);
+             for f in out.chunks_exact(2) {
+                 l.push(f[0]);
+                 r.push(f[1]);
+@@ -1169,6 +1185,56 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn direct_bus_takes_the_configured_gain() {
++        let set = synth_set(&[30.0, -30.0], &[0.0], 300);
++        let mut stage = ready_stage(&set);
++        let len = 3 * BRIR_BLOCK;
++        let mut out = vec![0.0f32; 2 * len];
++        stage.render_frame(
++            &impulse_on(2, len),
++            3,
++            len,
++            HeadPose::identity(),
++            DirectFeed::from_live(5.5, None),
++            &mut out,
++        );
++        let lat = stage.latency_samples();
++        let (l, r) = (out[2 * lat], out[2 * lat + 1]);
++        assert!((l - 1.883_649).abs() < 1e-5, "{l}");
++        assert!((r - 1.883_649).abs() < 1e-5, "{r}");
++    }
++
++    #[test]
++    fn direct_bus_applies_the_lowpass() {
++        let set = synth_set(&[30.0, -30.0], &[0.0], 300);
++        let mut stage = ready_stage(&set);
++        let len = 96_000;
++        let mut bus = vec![0.0f32; 3 * len];
++        for i in 0..len {
++            bus[3 * i + 2] = (std::f64::consts::TAU * 1000.0 * i as f64 / 48_000.0).sin() as f32;
++        }
++        let mut out = vec![0.0f32; 2 * len];
++        stage.render_frame(
++            &bus,
++            3,
++            len,
++            HeadPose::identity(),
++            DirectFeed::from_live(DIRECT_EAR_GAIN_DB, Some(120)),
++            &mut out,
++        );
++        let in_sq: f64 = (len / 2..len)
++            .map(|i| f64::from(bus[3 * i + 2]).powi(2))
++            .sum();
++        for ear in 0..2 {
++            let out_sq: f64 = (len / 2..len)
++                .map(|i| f64::from(out[2 * i + ear]).powi(2))
++                .sum();
++            let db = 10.0 * (out_sq / in_sq).log10();
++            assert!(db <= -60.0, "ear {ear}: {db}");
++        }
++    }
++
+     #[test]
+     fn direct_bus_feeds_both_ears_at_constant_power() {
+         let set = synth_set(&[30.0, -30.0], &[0.0], 300);
+@@ -1567,7 +1633,14 @@ mod tests {
+         assert!(!stage.is_ready());
+         assert_eq!(stage.latency_samples(), BRIR_BLOCK - 1);
+         let mut out = vec![0.0f32; 80];
+-        stage.render_frame(&[1.0; 120], 3, 40, HeadPose::identity(), &mut out);
++        stage.render_frame(
++            &[1.0; 120],
++            3,
++            40,
++            HeadPose::identity(),
++            DirectFeed::default(),
++            &mut out,
++        );
+         assert!(out.iter().all(|&v| v == 0.0));
+     }
+ 
+@@ -1683,6 +1756,7 @@ mod tests {
+                             BUSES,
+                             BRIR_BLOCK,
+                             HeadPose::identity(),
++                            DirectFeed::default(),
+                             &mut out,
+                         );
+                         let us = start.elapsed().as_secs_f64() * 1e6;
+diff --git a/omniphony-renderer/renderer/src/binaural/mod.rs b/omniphony-renderer/renderer/src/binaural/mod.rs
+index c823504..15bef90 100644
+--- a/omniphony-renderer/renderer/src/binaural/mod.rs
++++ b/omniphony-renderer/renderer/src/binaural/mod.rs
+@@ -49,11 +49,86 @@ pub use head_pose::HeadPose;
+ pub use tracking::{CalibrationStep, HeadTracking, HeadTrackingFormat};
+ 
+ use crate::delay_line::DelayLine;
++use crate::dsp::iir::{BiquadCoeffs, BiquadState, biquad};
+ 
+ /// Gain of a direct (non-spatialized) bus into each ear: constant power, the
+ /// binaural stage's standing policy for the LFE (issue #156). Shared by the
+ /// direct and the BRIR paths.
+ const DIRECT_EAR_GAIN: f32 = std::f32::consts::FRAC_1_SQRT_2;
++/// [`DIRECT_EAR_GAIN`] in decibels: the default of `binaural_lfe_gain_db`.
++pub const DIRECT_EAR_GAIN_DB: f32 = -3.0103;
++
++/// How a direct bus reaches each ear.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct DirectFeed {
++    /// Linear gain into each ear.
++    pub gain: f32,
++    /// Low-pass corner in Hz; `None` leaves the bus full band.
++    pub lowpass_hz: Option<u32>,
++}
++
++impl DirectFeed {
++    /// The default decibel value maps to [`DIRECT_EAR_GAIN`] itself, so an
++    /// unset option renders bit for bit as before.
++    pub fn from_live(gain_db: f32, lowpass_hz: Option<u32>) -> Self {
++        let gain = if gain_db == DIRECT_EAR_GAIN_DB {
++            DIRECT_EAR_GAIN
++        } else {
++            crate::dsp::db::db_to_linear(gain_db)
++        };
++        Self { gain, lowpass_hz }
++    }
++}
++
++impl Default for DirectFeed {
++    fn default() -> Self {
++        Self {
++            gain: DIRECT_EAR_GAIN,
++            lowpass_hz: None,
++        }
++    }
++}
++
++/// 4th-order Linkwitz-Riley low-pass of a direct bus: two cascaded
++/// Butterworth sections, as the crossover builds its LR4 low band.
++#[derive(Clone, Copy)]
++pub(crate) struct LfeLowpass {
++    /// Coefficients and the corner and rate they were built for.
++    tuned: Option<(u32, u32, BiquadCoeffs)>,
++    stages: [BiquadState; 2],
++}
++
++impl LfeLowpass {
++    pub(crate) fn new() -> Self {
++        Self {
++            tuned: None,
++            stages: [BiquadState::default(); 2],
++        }
++    }
++
++    /// With no corner, `x` unchanged and the state cleared. A new corner or
++    /// rate rebuilds the coefficients and keeps the state.
++    pub(crate) fn process(&mut self, x: f32, corner_hz: Option<u32>, sample_rate: u32) -> f32 {
++        let Some(fc) = corner_hz else {
++            self.reset();
++            return x;
++        };
++        let c = match self.tuned {
++            Some((f, r, c)) if f == fc && r == sample_rate => c,
++            _ => {
++                let c = BiquadCoeffs::butterworth2_lp(fc as f32, sample_rate);
++                self.tuned = Some((fc, sample_rate, c));
++                c
++            }
++        };
++        let [s1, s2] = &mut self.stages;
++        biquad(biquad(x, c, s1), c, s2)
++    }
++
++    pub(crate) fn reset(&mut self) {
++        self.stages = [BiquadState::default(); 2];
++    }
++}
+ use crate::live_params::{BinauralReflections, BinauralReverb};
+ use convolver::EarConvolver;
+ use hrir::{DirectionKey, HRIR_LEN, HrirPair, HrirSet, ParametricPinnaHrir};
+@@ -294,6 +369,8 @@ struct ChannelDsp {
+     /// up to a quarter second of audio in it — and replayed them the moment
+     /// its gain came back.
+     flush: u32,
++    /// LFE low-pass of the direct feed.
++    lfe_lp: LfeLowpass,
+ }
+ 
+ impl ChannelDsp {
+@@ -310,6 +387,7 @@ impl ChannelDsp {
+             air_coeff: 0.0,
+             last_dir: None,
+             flush: 0,
++            lfe_lp: LfeLowpass::new(),
+         }
+     }
+ 
+@@ -390,6 +468,8 @@ pub struct BinauralFrameParams {
+     pub air_absorption: bool,
+     /// How finely a direction must change before its HRIR is rebuilt.
+     pub hrir_update_lattice: crate::live_params::HrirUpdateLattice,
++    /// How the direct buses (the LFE) reach each ear.
++    pub direct_feed: DirectFeed,
+ }
+ 
+ /// What the last HRIR grid build produced, for the control surface.
+@@ -858,6 +938,7 @@ impl BinauralRenderer {
+             ref reverb,
+             air_absorption,
+             hrir_update_lattice,
++            direct_feed,
+         } = *params;
+         debug_assert_eq!(out.len(), sample_length * 2);
+         if sample_length == 0 || (input_channel_count == 0 && extra.is_none()) {
+@@ -972,16 +1053,20 @@ impl BinauralRenderer {
+             // The extra source is never "direct": it is an object by definition,
+             // and placing it is the entire point.
+             if !in_extra_slot && chan_direct.get(c).copied().unwrap_or(false) {
+-                if let Some(Some(dsp)) = self.channels.get_mut(c) {
+-                    // Nothing of the spatialized state is drained on this
+-                    // path; a channel switching back to it starts its
+-                    // histories over.
+-                    dsp.flush = 0;
+-                    dsp.refl_live = false;
+-                }
++                let rate = self.sample_rate;
++                // The state carries the LFE low-pass: built on first use past
++                // PREALLOC_CHANNELS, as below.
++                let dsp = self.channels[c].get_or_insert_with(|| ChannelDsp::new(rate));
++                // Nothing of the spatialized state is drained on this
++                // path; a channel switching back to it starts its
++                // histories over.
++                dsp.flush = 0;
++                dsp.refl_live = false;
+                 for s in 0..span {
+                     let g = gain.start + gain.step * s as f32;
+-                    let v = src_pcm[s * src_stride + src_offset] * g * DIRECT_EAR_GAIN;
++                    let x = src_pcm[s * src_stride + src_offset];
++                    let v =
++                        dsp.lfe_lp.process(x, direct_feed.lowpass_hz, rate) * g * direct_feed.gain;
+                     let o = s * 2;
+                     out[o] += v;
+                     out[o + 1] += v;
+@@ -1288,6 +1373,129 @@ mod tests {
+             },
+             air_absorption: false,
+             hrir_update_lattice: crate::live_params::HrirUpdateLattice::default(),
++            direct_feed: DirectFeed::default(),
++        }
++    }
++
++    #[test]
++    fn direct_feed_default_is_the_v070_constant() {
++        assert_eq!(DirectFeed::default().gain, DIRECT_EAR_GAIN);
++        assert_eq!(
++            DirectFeed::from_live(DIRECT_EAR_GAIN_DB, None).gain,
++            DIRECT_EAR_GAIN
++        );
++    }
++
++    #[test]
++    fn direct_feed_gain_follows_db() {
++        assert!((DirectFeed::from_live(5.5, None).gain - 1.883_649).abs() < 1e-5);
++    }
++
++    #[test]
++    fn direct_channel_takes_the_direct_feed_gain() {
++        let mut r = BinauralRenderer::new(48_000);
++        let n = 256;
++        let input = vec![0.5f32; n];
++        let mut out = vec![0.0f32; n * 2];
++        let params = BinauralFrameParams {
++            direct_feed: DirectFeed::from_live(5.5, None),
++            ..dry_params()
++        };
++        r.render_frame(
++            &input,
++            1,
++            n,
++            &params,
++            &[[0.0, 1.0, 0.0]],
++            &[ChannelGain::flat(1.0)],
++            &[true],
++            None,
++            &mut out,
++        );
++        for v in &out {
++            assert!((v - 0.5 * 1.883_649).abs() < 1e-5, "{v}");
++        }
++    }
++
++    /// Sample `i` of a 48 kHz sine of amplitude 1.0 at `freq` Hz.
++    fn sine_48k(freq: f64, i: usize) -> f32 {
++        (std::f64::consts::TAU * freq * i as f64 / 48_000.0).sin() as f32
++    }
++
++    /// Level in dB of a 48 kHz sine at `freq` through the LFE low-pass at
++    /// `corner`: output RMS against input RMS over the second of two seconds.
++    fn lfe_lowpass_level_db(corner: Option<u32>, freq: f64) -> f64 {
++        let mut lp = LfeLowpass::new();
++        let n = 96_000;
++        let (mut in_sq, mut out_sq) = (0.0f64, 0.0f64);
++        for i in 0..n {
++            let x = sine_48k(freq, i);
++            let y = lp.process(x, corner, 48_000);
++            if i >= n / 2 {
++                in_sq += f64::from(x) * f64::from(x);
++                out_sq += f64::from(y) * f64::from(y);
++            }
++        }
++        10.0 * (out_sq / in_sq).log10()
++    }
++
++    #[test]
++    fn lfe_lowpass_unset_is_transparent() {
++        let mut lp = LfeLowpass::new();
++        for i in 0..96_000 {
++            let x = sine_48k(1000.0, i);
++            assert_eq!(lp.process(x, None, 48_000), x, "sample {i}");
++        }
++    }
++
++    #[test]
++    fn lfe_lowpass_120_passes_30_hz() {
++        let db = lfe_lowpass_level_db(Some(120), 30.0);
++        assert!(db.abs() <= 0.1, "{db}");
++    }
++
++    #[test]
++    fn lfe_lowpass_120_is_6_db_down_at_the_corner() {
++        let db = lfe_lowpass_level_db(Some(120), 120.0);
++        assert!((db + 6.0).abs() <= 0.2, "{db}");
++    }
++
++    #[test]
++    fn lfe_lowpass_120_stops_1_khz() {
++        let db = lfe_lowpass_level_db(Some(120), 1000.0);
++        assert!(db <= -60.0, "{db}");
++    }
++
++    #[test]
++    fn direct_channel_applies_the_lowpass() {
++        let mut r = BinauralRenderer::new(48_000);
++        let params = BinauralFrameParams {
++            direct_feed: DirectFeed::from_live(DIRECT_EAR_GAIN_DB, Some(120)),
++            ..dry_params()
++        };
++        let n = 96_000;
++        let input: Vec<f32> = (0..n).map(|i| sine_48k(1000.0, i)).collect();
++        let mut out = vec![0.0f32; 2 * n];
++        for (block, out_block) in input.chunks(960).zip(out.chunks_mut(2 * 960)) {
++            r.render_frame(
++                block,
++                1,
++                block.len(),
++                &params,
++                &[[0.0, 1.0, 0.0]],
++                &[ChannelGain::flat(1.0)],
++                &[true],
++                None,
++                out_block,
++            );
++        }
++        let in_sq: f64 = input[n / 2..].iter().map(|&x| f64::from(x).powi(2)).sum();
++        for ear in 0..2 {
++            let out_sq: f64 = (n / 2..n)
++                .map(|i| f64::from(out[2 * i + ear]).powi(2))
++                .sum();
++            let db = 10.0 * (out_sq / in_sq).log10();
++            assert!(db <= -60.0, "ear {ear}: {db}");
+         }
+     }
+ 
+diff --git a/omniphony-renderer/renderer/src/config.rs b/omniphony-renderer/renderer/src/config.rs
+index f28320b..b6e1db8 100644
+--- a/omniphony-renderer/renderer/src/config.rs
++++ b/omniphony-renderer/renderer/src/config.rs
+@@ -427,6 +427,12 @@ pub struct BinauralConfig {
+     /// distance). Default 0.0875 (KEMAR-ish).
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub head_radius_m: Option<f32>,
++    /// Gain of a direct bus (the LFE) into each ear, in dB. Default -3.0103.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub lfe_gain_db: Option<f32>,
++    /// Low-pass corner of a direct bus (the LFE) in Hz. Default unset.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub lfe_lowpass_hz: Option<u32>,
+     /// HRIR data set: `"synthetic"`, `"saf"`/`"kemar"` (embedded measured, default),
+     /// or `"sofa"` (uses `hrtf_sofa_path`; needs the `sofa` build feature).
+     #[serde(skip_serializing_if = "Option::is_none")]
+diff --git a/omniphony-renderer/renderer/src/live_params.rs b/omniphony-renderer/renderer/src/live_params.rs
+index 67ee85e..221c413 100644
+--- a/omniphony-renderer/renderer/src/live_params.rs
++++ b/omniphony-renderer/renderer/src/live_params.rs
+@@ -629,6 +629,10 @@ pub struct BinauralLiveParams {
+     /// Effective head radius (m) for the Woodworth ITD model — half the
+     /// inter-ear distance. Per-listener fit; default is KEMAR-ish.
+     pub head_radius_m: f32,
++    /// Gain of a direct bus (the LFE) into each ear, in dB.
++    pub lfe_gain_db: f32,
++    /// Low-pass corner of a direct bus in Hz; `None` leaves it full band.
++    pub lfe_lowpass_hz: Option<u32>,
+     /// Current (smoothed) head orientation applied to world positions. Updated by
+     /// the head-tracking input or set directly via the `head/*` OSC controls.
+     pub head_pose: crate::binaural::HeadPose,
+@@ -677,6 +681,8 @@ impl Default for BinauralLiveParams {
+             ears: [EarLiveParams::default(); 2],
+             unit_scale_m: 1.0,
+             head_radius_m: crate::binaural::itd::DEFAULT_HEAD_RADIUS_M,
++            lfe_gain_db: crate::binaural::DIRECT_EAR_GAIN_DB,
++            lfe_lowpass_hz: None,
+             head_pose: crate::binaural::HeadPose::identity(),
+             tracking: crate::binaural::HeadTracking::default(),
+             hrir_source: crate::binaural::HrirSource::default(),
+diff --git a/omniphony-renderer/renderer/src/options.rs b/omniphony-renderer/renderer/src/options.rs
+index 28a9d9e..4a0e52d 100644
+--- a/omniphony-renderer/renderer/src/options.rs
++++ b/omniphony-renderer/renderer/src/options.rs
+@@ -922,6 +922,12 @@ const HEAD_RADIUS_KIND: OptionKind = OptionKind::Float {
+     max: 0.15,
+     step: 0.001,
+ };
++const LFE_GAIN_KIND: OptionKind = OptionKind::Float {
++    min: -24.0,
++    max: 12.0,
++    step: 0.1,
++};
++const LFE_LOWPASS_KIND: OptionKind = OptionKind::OptionalInt { min: 20, max: 500 };
+ const UNIT_LEVEL_KIND: OptionKind = OptionKind::Float {
+     min: 0.0,
+     max: 1.0,
+@@ -2320,6 +2326,59 @@ const HAND_WIRED_ROWS: &[OptionSpec] = &[
+             }
+         },
+     },
++    OptionSpec {
++        key: "binaural_lfe_gain_db",
++        kind: LFE_GAIN_KIND,
++        default: OptionDefault::Float(crate::binaural::DIRECT_EAR_GAIN_DB),
++        flags: OptionFlags::NONE,
++        group: None,
++        i18n_key: "binaural.lfeGainDb",
++        help_i18n_key: Some("help.binaural.lfeGainDb"),
++        legacy_control_addr: LegacyAddr::None,
++        set: |live, raw, _env| {
++            let v = raw_float_if(raw, LFE_GAIN_KIND, any_value)?;
++            live.binaural.lfe_gain_db = v;
++            Some(format!("{v}"))
++        },
++        get_json: |live| live.binaural.lfe_gain_db.into(),
++        config_store: |render, live, _env| {
++            binaural_cfg_mut(render).lfe_gain_db = Some(live.binaural.lfe_gain_db);
++        },
++        config_seed: |live, render, _env| {
++            if let Some(v) = binaural_cfg(render).and_then(|b| b.lfe_gain_db)
++                && v.is_finite()
++            {
++                live.binaural.lfe_gain_db = clamp_to(LFE_GAIN_KIND, v);
++            }
++        },
++    },
++    OptionSpec {
++        key: "binaural_lfe_lowpass_hz",
++        kind: LFE_LOWPASS_KIND,
++        default: OptionDefault::Unset,
++        flags: OptionFlags::NONE,
++        group: None,
++        i18n_key: "binaural.lfeLowpassHz",
++        help_i18n_key: Some("help.binaural.lfeLowpassHz"),
++        legacy_control_addr: LegacyAddr::None,
++        set: |live, raw, _env| {
++            let v = raw_optional_int(raw, LFE_LOWPASS_KIND)?.map(|hz| hz as u32);
++            live.binaural.lfe_lowpass_hz = v;
++            Some(v.map_or_else(String::new, |hz| hz.to_string()))
++        },
++        get_json: |live| live.binaural.lfe_lowpass_hz.into(),
++        config_store: |render, live, _env| {
++            binaural_cfg_mut(render).lfe_lowpass_hz = live.binaural.lfe_lowpass_hz;
++        },
++        config_seed: |live, render, _env| {
++            if let Some(v) = binaural_cfg(render).and_then(|b| b.lfe_lowpass_hz) {
++                live.binaural.lfe_lowpass_hz =
++                    raw_optional_int(&RawOptionValue::Number(f64::from(v)), LFE_LOWPASS_KIND)
++                        .flatten()
++                        .map(|hz| hz as u32);
++            }
++        },
++    },
+     OptionSpec {
+         key: "binaural_air_absorption",
+         kind: OptionKind::Bool,
+@@ -3810,6 +3869,60 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn binaural_lfe_gain_db_round_trips_through_config() {
++        let env = OptionEnv::detached();
++        let spec = find("binaural_lfe_gain_db").expect("binaural_lfe_gain_db is declared");
++        let mut live = LiveParams::default();
++        assert_eq!(
++            live.binaural.lfe_gain_db,
++            crate::binaural::DIRECT_EAR_GAIN_DB
++        );
++        assert!((spec.set)(&mut live, &RawOptionValue::Number(5.5), &env).is_some());
++        assert_eq!(live.binaural.lfe_gain_db, 5.5);
++        let mut render = RenderConfig::default();
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.lfe_gain_db),
++            Some(5.5)
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert_eq!(seeded.binaural.lfe_gain_db, 5.5);
++    }
++
++    #[test]
++    fn binaural_lfe_lowpass_hz_round_trips_through_config() {
++        let env = OptionEnv::detached();
++        let spec = find("binaural_lfe_lowpass_hz").expect("binaural_lfe_lowpass_hz is declared");
++        let mut live = LiveParams::default();
++        assert_eq!(live.binaural.lfe_lowpass_hz, None);
++        assert!((spec.set)(&mut live, &RawOptionValue::Number(120.0), &env).is_some());
++        assert_eq!(live.binaural.lfe_lowpass_hz, Some(120));
++        assert_eq!((spec.get_json)(&live), serde_json::json!(120));
++        let mut render = RenderConfig::default();
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.lfe_lowpass_hz),
++            Some(120)
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert_eq!(seeded.binaural.lfe_lowpass_hz, Some(120));
++
++        assert!((spec.set)(&mut live, &RawOptionValue::Null, &env).is_some());
++        assert_eq!(live.binaural.lfe_lowpass_hz, None);
++        assert_eq!((spec.get_json)(&live), serde_json::Value::Null);
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.lfe_lowpass_hz),
++            None
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert_eq!(seeded.binaural.lfe_lowpass_hz, None);
++    }
++
+     /// A bare `sofa` / `brir` reopens the file last named for it, and the
+     /// config keeps both files whatever the selector in force: a room
+     /// response left for KEMAR, saved, and chosen again plays the same file.
+diff --git a/omniphony-renderer/renderer/src/spatial_renderer/cascade.rs b/omniphony-renderer/renderer/src/spatial_renderer/cascade.rs
+index d9d09ad..6c68fe7 100644
+--- a/omniphony-renderer/renderer/src/spatial_renderer/cascade.rs
++++ b/omniphony-renderer/renderer/src/spatial_renderer/cascade.rs
+@@ -248,6 +248,7 @@ pub(super) fn render_cascade_frame(
+                 total,
+                 sample_length,
+                 binaural_params.head_pose,
++                binaural_params.direct_feed,
+                 output,
+             );
+         }
+diff --git a/omniphony-renderer/renderer/src/spatial_renderer/mod.rs b/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
+index 328928d..36b999a 100644
+--- a/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
++++ b/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
+@@ -1003,6 +1003,10 @@ impl SpatialRenderer {
+                         reverb: g.binaural.reverb.clone(),
+                         air_absorption: g.binaural.air_absorption,
+                         hrir_update_lattice: g.binaural.hrir_update_lattice,
++                        direct_feed: crate::binaural::DirectFeed::from_live(
++                            g.binaural.lfe_gain_db,
++                            g.binaural.lfe_lowpass_hz,
++                        ),
+                     },
+                     g.binaural.ears,
+                     g.binaural.reads_on_sphere(),
+diff --git a/omniphony-renderer/runtime_control/tests/live_options_conformance.rs b/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
+index 7a29317..1ca6aa0 100644
+--- a/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
++++ b/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
+@@ -367,6 +367,7 @@ mod registry {
+             ("brir_tail_floor_db", RawOptionValue::Number(70.0)),
+             ("binaural_unit_scale_m", RawOptionValue::Number(2.0)),
+             ("binaural_head_radius_m", RawOptionValue::Number(0.09)),
++            ("binaural_lfe_lowpass_hz", RawOptionValue::Number(120.0)),
+             ("binaural_air_absorption", RawOptionValue::Bool(false)),
+             ("binaural_diffuse_field_eq", RawOptionValue::Bool(true)),
+             ("binaural_sphere_coordinates", RawOptionValue::Bool(true)),
+diff --git a/omniphony-studio-egui/i18n/en.json b/omniphony-studio-egui/i18n/en.json
+index 310e0a3..415a87e 100644
+--- a/omniphony-studio-egui/i18n/en.json
++++ b/omniphony-studio-egui/i18n/en.json
+@@ -125,6 +125,8 @@
+   "help.binaural.brirMaxLength": "Longest room response kept, in seconds; whole keeps everything the tail-floor cut leaves. Shorter responses cost less per sample.",
+   "help.binaural.brirTailFloor": "Decibels below a response's total energy at which its tail is cut. 60 dB keeps the audible decay; a lower value keeps less of the tail.",
+   "help.binaural.headRadius": "Radius of the listener's head in centimetres. Sets the interaural time/level differences; match your own head for sharper localization (average ≈ 8.75 cm).",
++  "help.binaural.lfeGainDb": "Gain of the LFE, and of any other channel that bypasses the HRTF, into each ear (dB). The default, -3.01 dB, splits it between the ears at constant power.",
++  "help.binaural.lfeLowpassHz": "Corner frequency of a 4th-order Linkwitz-Riley low-pass on the LFE and the other channels that bypass the HRTF (Hz). Unset: no filter.",
+   "help.binaural.pinnaPreset": "Per-listener D_n preset from Brown & Duda (1998), Table I — the only parameter the model individualizes. PB & NH and RD are the published subject fits; pick whichever localizes elevation best for you.",
+   "help.binaural.pinnaDScale": "Fine scale on the elevation factor D_n: how strongly the pinna notches move with elevation. 100% is the chosen preset as published; raise/lower to sharpen or soften the vertical effect.",
+   "help.binaural.pinnaDepth": "Strength of the parametric pinna echoes. 0% is the bare head-shadow model (≈ Synthetic, no elevation cue); 100% is full pinna colouration that adds the elevation and front/back cues.",
+@@ -802,6 +804,8 @@
+   "binaural.sofaBrowseTitle": "Browse the sofacoustics.org HRTF database",
+   "binaural.hrtfFallback": "{effective} in use: the selected HRTF could not be loaded (hover for the reason).",
+   "binaural.headRadius": "Head radius (cm)",
++  "binaural.lfeGainDb": "LFE gain (dB)",
++  "binaural.lfeLowpassHz": "LFE low-pass (Hz)",
+   "binaural.pinnaPreset": "Pinna preset (D)",
+   "binaural.pinnaPreset.pbnh": "PB & NH",
+   "binaural.pinnaPreset.rd": "RD",
