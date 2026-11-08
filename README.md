@@ -28,7 +28,7 @@ brew install colima docker docker-buildx
 colima start
 ```
 
-Then add the `cliPluginsExtraDirs` entry that `brew info docker-buildx` shows to `~/.docker/config.json`, so that Docker finds buildx. colima shares only your home folder with Docker. For music in other folders, see [colima's FAQ](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md#issue-with-docker-bind-mount-showing-empty).
+Then add the `cliPluginsExtraDirs` entry that `brew info docker-buildx` shows to `~/.docker/config.json`, so that Docker finds buildx. By default colima shares only your home folder with Docker. For music in other folders, see [colima's FAQ](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md#issue-with-docker-bind-mount-showing-empty).
 
 Debian and Ubuntu:
 
@@ -101,14 +101,20 @@ You can pass several files and folders; a folder contributes the `.thd` files di
 
 ### Usage with Docker
 
-The container sees only the current folder. Run `atmos2binaural` in the folder that holds the album folders, and pass paths relative to it:
+With Docker the command is `atmos2binaural`, without `./` and `.py`. It can only see the folder you run it in. So go to the folder that holds your album folder, and give the album folder by its name:
 
 ```bash
 cd ~/Music
 atmos2binaural "My Atmos Album"
 ```
 
-This writes `~/Music/My Atmos Album (binaural)/`. The options are the same as above. A version as the first argument runs that image instead of the latest:
+This writes `~/Music/My Atmos Album (binaural)/`.
+
+- Names only: a path that starts with `/` or `~` does not work, also not after `-o`. Write `-o Converted` to get the output in `~/Music/Converted/`.
+- With colima on macOS, the folder must be one that colima shares with Docker; by default that is only your home folder.
+- The options are the same as above.
+
+Each run first fetches the latest version. To run a specific version instead, put its number first:
 
 ```bash
 atmos2binaural 1.0.0 "My Atmos Album"
@@ -148,4 +154,4 @@ With `--allow-damaged` it is converted anyway; it comes out shorter where the de
 
 ## Licence
 
-GPL-3.0-or-later, see `LICENSE`. The `harletty` decoder that `scripts/build-deps.sh` builds is LGPL-3.0.
+GPL-3.0-or-later, see `LICENSE`. The `harletty` decoder that `scripts/build-deps.sh` builds is LGPL-3.0. The Docker image is built from this repository: the `Dockerfile` and `scripts/build-deps.sh` name every upstream source revision it contains.
