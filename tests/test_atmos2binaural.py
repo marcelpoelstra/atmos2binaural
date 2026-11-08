@@ -531,5 +531,71 @@ class ConversionTests(TempDirTestCase):
         self.assertIn("damaged tracks: 1", out)
 
 
+class ContainerModeTests(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.mount = self.tmp / "data"
+        self.mount.mkdir()
+
+    def switch(self, euid, uid, gid):
+        calls = mock.Mock()
+        stat = os.stat_result((0o40755, 0, 0, 0, uid, gid, 0, 0, 0, 0))
+        with mock.patch.object(a2b.os, "geteuid", return_value=euid), \
+             mock.patch.object(a2b.os, "stat", return_value=stat), \
+             mock.patch.object(a2b.os, "setgroups", calls.setgroups), \
+             mock.patch.object(a2b.os, "setgid", calls.setgid), \
+             mock.patch.object(a2b.os, "setuid", calls.setuid):
+            a2b.switch_to_mount_owner(self.mount)
+        return calls.mock_calls
+
+    def test_switch_takes_owner_and_group_as_root(self):
+        self.assertEqual(self.switch(0, 1000, 1001), [mock.call.setgroups([]), mock.call.setgid(1001), mock.call.setuid(1000)])
+
+    def test_switch_keeps_root_for_a_root_owned_mount(self):
+        self.assertEqual(self.switch(0, 0, 0), [])
+
+    def test_switch_does_nothing_without_root(self):
+        self.assertEqual(self.switch(1000, 1000, 1001), [])
+
+    def test_guard_accepts_folders_in_the_mount(self):
+        a2b.check_output_inside(self.mount / "album (binaural)", self.mount)
+        a2b.check_output_inside(self.mount, self.mount)
+
+    def test_guard_refuses_default_output_of_the_mount(self):
+        out = a2b.default_output_dir(self.mount)
+        with self.assertRaises(a2b.ConversionError) as caught:
+            a2b.check_output_inside(out, self.mount)
+        self.assertEqual(
+            str(caught.exception),
+            f"{out}: outside {self.mount}, the current folder as the container sees it; "
+            "run atmos2binaural in the folder that holds the album folders",
+        )
+
+    def test_guard_refuses_a_host_path(self):
+        with self.assertRaises(a2b.ConversionError):
+            a2b.check_output_inside(self.tmp / "Converted", self.mount)
+
+    def test_guard_refuses_a_symlink_out_of_the_mount(self):
+        (self.tmp / "elsewhere").mkdir()
+        (self.mount / "link").symlink_to(self.tmp / "elsewhere")
+        with self.assertRaises(a2b.ConversionError):
+            a2b.check_output_inside(self.mount / "link" / "out", self.mount)
+
+    def test_main_refuses_output_outside_the_mount(self):
+        for name in ("deps/bin/orender", "deps/bin/harletty", f"deps/lib/{a2b.PLUGIN}", "data/album/a.thd"):
+            self.touch(name)
+        outside = self.tmp / "Converted"
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {a2b.MOUNT_ENV: str(self.mount)}), \
+             mock.patch.object(a2b, "DEPS", self.tmp / "deps"), \
+             mock.patch.object(a2b, "switch_to_mount_owner") as switch, \
+             contextlib.redirect_stderr(err):
+            code = a2b.main([str(self.mount / "album"), "-o", str(outside)])
+        self.assertEqual(code, 1)
+        switch.assert_called_once_with(self.mount)
+        self.assertIn(f"{outside}: outside {self.mount}", err.getvalue())
+        self.assertFalse(outside.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

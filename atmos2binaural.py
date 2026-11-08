@@ -18,6 +18,7 @@ LFE_GAIN_DB = 5.5
 LFE_LOWPASS_HZ = 120
 CEILING_DBTP = -1.0
 TMP_DIR_NAME = ".atmos2binaural-tmp"
+MOUNT_ENV = "ATMOS2BINAURAL_MOUNT"
 DEPS = Path(__file__).resolve().parent / "deps"
 PLUGIN = "libharletty_dolby_bridge.dylib" if sys.platform == "darwin" else "libharletty_dolby_bridge.so"
 DAMAGE_PATTERN = re.compile(r"Parity check failed|could not be decoded|Parse error|ERROR")
@@ -120,6 +121,29 @@ def output_name(track: Path, fmt: str) -> str:
     return f"{track.stem}.{fmt}"
 
 
+def switch_to_mount_owner(mount: Path) -> None:
+    """As root, take the user and group that own `mount`, so that on a Linux
+    host the output belongs to the owner of the shared folder."""
+    if os.geteuid() != 0:
+        return
+    st = os.stat(mount)
+    if st.st_uid == 0:
+        return
+    os.setgroups([])
+    os.setgid(st.st_gid)
+    os.setuid(st.st_uid)
+
+
+def check_output_inside(out_dir: Path, mount: Path) -> None:
+    """Refuse an output folder outside `mount`, symlinks resolved: the container
+    removes it on exit."""
+    if not Path(os.path.realpath(out_dir)).is_relative_to(os.path.realpath(mount)):
+        raise ConversionError(
+            f"{out_dir}: outside {mount}, the current folder as the container sees it; "
+            "run atmos2binaural in the folder that holds the album folders"
+        )
+
+
 def check_deps() -> None:
     for path in (DEPS / "bin" / "orender", DEPS / "bin" / "harletty", DEPS / "lib" / PLUGIN):
         if not path.is_file():
@@ -216,10 +240,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     out_dir = tmp = None
     created = done = False
+    mount = os.environ.get(MOUNT_ENV)
     try:
+        if mount:
+            switch_to_mount_owner(Path(mount))
         tracks = collect_inputs(args.inputs)
         check_deps()
         out_dir = Path(args.output) if args.output else default_output_dir(Path(args.inputs[0]))
+        if mount:
+            check_output_inside(out_dir, Path(mount))
         created = not out_dir.exists()
         out_dir.mkdir(parents=True, exist_ok=True)
         tmp = out_dir / TMP_DIR_NAME
