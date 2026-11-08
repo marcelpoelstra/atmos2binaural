@@ -32,12 +32,24 @@ def stream_info(path: Path) -> dict:
     return json.loads(done.stdout)["streams"][0]
 
 
-def true_peak(path: Path) -> float:
+def levels(path: Path) -> tuple:
+    """(integrated loudness in LUFS, true peak in dBTP) of an audio file."""
     err = ffmpeg_tool(
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af", "ebur128=peak=true", "-f", "null", "-"
     ).stderr
     summary = err[err.rindex("Summary:"):]
-    return float(re.search(r"^\s+Peak:\s+(-?[\d.]+|-inf) dBFS", summary, re.M).group(1))
+    loudness = float(re.search(r"^\s+I:\s+(-?[\d.]+) LUFS", summary, re.M).group(1))
+    peak = float(re.search(r"^\s+Peak:\s+(-?[\d.]+|-inf) dBFS", summary, re.M).group(1))
+    return loudness, peak
+
+
+def sine_f32(path: Path) -> Path:
+    """2 s of a 1 kHz stereo sine at amplitude 0.5 (-6 dBTP) as raw float."""
+    ffmpeg_tool(
+        "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=2",
+        "-af", "volume=4,pan=stereo|FL=c0|FR=c0", "-f", "f32le", str(path),
+    )
+    return path
 
 
 def sha256(path: Path) -> str:
@@ -146,6 +158,10 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(args.format, "flac")
         self.assertIsNone(args.output)
         self.assertIs(args.allow_damaged, False)
+        self.assertEqual(args.hrtf, "synthetic")
+
+    def test_parse_args_hrtf_kemar(self):
+        self.assertEqual(a2b.parse_args(["--hrtf", "kemar", "a.thd"]).hrtf, "kemar")
 
     def test_parse_args_allow_damaged(self):
         args = a2b.parse_args(["--allow-damaged", "a.thd"])
@@ -164,12 +180,16 @@ class CommandTests(unittest.TestCase):
                 "/d/deps/bin/orender", "render", "/a/t.thd",
                 "--config", "/o/tmp/orender.yaml",
                 "--bridge-path", f"/d/deps/lib/{plugin}",
-                "--output-mode", "binaural",
+                "--output-mode", "binaural", "--hrir-source", "synthetic",
                 "--output-backend", "file", "--output-file", "/o/tmp/1.f32", "--output-file-format", "raw_f32",
                 "--binaural-lfe-gain-db", "5.5", "--binaural-lfe-lowpass-hz", "120",
                 "--loglevel", "warn",
             ],
         )
+
+    def test_orender_command_takes_kemar(self):
+        command = a2b.orender_command(Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "kemar")
+        self.assertEqual(command[command.index("--hrir-source") + 1], "kemar")
 
     def test_harletty_command_matches_design(self):
         with mock.patch.object(a2b, "DEPS", Path("/d/deps")):
@@ -237,16 +257,25 @@ class StreamCheckTests(TempDirTestCase):
         self.assertRegex(lines[0], "Parity check failed|Parse error")
 
 
-class LevelTests(unittest.TestCase):
-    def test_album_gain_brings_highest_peak_to_ceiling(self):
-        self.assertAlmostEqual(a2b.album_gain([4.1, 9.3, 1.9]), -10.3, delta=1e-9)
+class LevelTests(TempDirTestCase):
+    def test_playback_loudness_is_the_stereo_downmix(self):
+        track = make_truehd(self.tmp / "a.thd")
+        stereo = self.tmp / "stereo.wav"
+        # Float, as mpv downmixes: an integer target makes FFmpeg scale the downmix down.
+        ffmpeg_tool("ffmpeg", "-v", "error", "-i", str(track), "-ac", "2", "-c:a", "pcm_f32le", str(stereo))
+        self.assertAlmostEqual(a2b.playback_loudness(track), levels(stereo)[0], delta=0.05)
 
-    def test_album_gain_can_raise(self):
-        self.assertEqual(a2b.album_gain([-6.0]), 5.0)
+    def test_encode_applies_the_gain_below_the_ceiling(self):
+        dest = self.tmp / "quiet.flac"
+        a2b.encode(sine_f32(self.tmp / "sine.f32"), 48000, -6.0, "flac", dest)
+        self.assertAlmostEqual(levels(dest)[1], -12.0, delta=0.2)
+        self.assertEqual(stream_info(dest)["duration_ts"], 96000)
 
-    def test_album_gain_ignores_silence(self):
-        self.assertEqual(a2b.album_gain([float("-inf"), -5.0]), 4.0)
-        self.assertEqual(a2b.album_gain([float("-inf")]), 0.0)
+    def test_encode_limits_true_peak(self):
+        dest = self.tmp / "loud.flac"
+        a2b.encode(sine_f32(self.tmp / "sine.f32"), 48000, 12.0, "flac", dest)
+        self.assertLessEqual(levels(dest)[1], -1.0)
+        self.assertEqual(stream_info(dest)["duration_ts"], 96000)
 
 
 class EncodeCommandTests(unittest.TestCase):
@@ -256,7 +285,9 @@ class EncodeCommandTests(unittest.TestCase):
             command,
             [
                 "ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ch_layout", "stereo",
-                "-i", "/o/tmp/1.f32", "-af", "volume=-10.3000dB:precision=float",
+                "-i", "/o/tmp/1.f32",
+                "-af", "volume=-10.3000dB:precision=float,aresample=192000,"
+                "alimiter=limit=0.891251:level=false:latency=true,aresample=48000",
                 "-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
                 "/o/tmp/t.flac",
             ],
@@ -309,7 +340,10 @@ class ConversionTests(TempDirTestCase):
                 (info["codec_name"], info["sample_rate"], info["bits_per_raw_sample"], info["duration_ts"]),
                 ("flac", "48000", "24", 96000),
             )
-        self.assertAlmostEqual(max(true_peak(self.out / n) for n in self.outputs()), -1.0, delta=0.1)
+        for name in self.outputs():
+            loudness, peak = levels(self.out / name)
+            self.assertAlmostEqual(loudness, a2b.playback_loudness(self.src / f"{name[:-5]}.thd"), delta=0.3)
+            self.assertLessEqual(peak, -1.0)
 
     @needs_deps
     def test_convert_wav(self):
@@ -344,11 +378,11 @@ class ConversionTests(TempDirTestCase):
         real = a2b.render
         calls = []
 
-        def render(track, f32, tmp):
+        def render(track, *args):
             calls.append(track)
             if len(calls) == 2:
                 raise a2b.ConversionError("render failed")
-            return real(track, f32, tmp)
+            return real(track, *args)
 
         with mock.patch.object(a2b, "render", render):
             code, _, _ = self.run_main(self.src, "-o", self.out)
@@ -405,8 +439,8 @@ class ConversionTests(TempDirTestCase):
     def render_with_error_on(self, name):
         real = a2b.render
 
-        def render(track, f32, tmp):
-            return real(track, f32, tmp) + ([self.ERROR_LINE] if track.name == name else [])
+        def render(track, *args):
+            return real(track, *args) + ([self.ERROR_LINE] if track.name == name else [])
 
         return render
 

@@ -45,6 +45,7 @@ This writes `/Music/My Atmos Album (binaural)/` with one FLAC file per track, na
 | --- | --- |
 | `-o FOLDER` | Write to `FOLDER` instead; it is created when missing |
 | `-f wav` | Write WAV instead of FLAC |
+| `--hrtf kemar` | Use the measured KEMAR head instead of the default synthetic head: more front, back and height cues, but less bass and a brighter sound |
 | `--allow-damaged` | Convert damaged tracks anyway, see below |
 
 You can pass several files and folders; a folder contributes the `.thd` files directly inside it. For example:
@@ -56,7 +57,7 @@ You can pass several files and folders; a folder contributes the `.thd` files di
 ## Output
 
 - 24-bit FLAC or WAV at the sample rate of the source.
-- All tracks of one run get the same gain, which puts the loudest peak at -1 dBTP. Convert a whole album in one run to keep its tracks at the right level relative to each other.
+- Each track plays as loud as its TrueHD file does in a stereo player; a limiter keeps peaks at or below -1 dBTP.
 - The LFE channel is included, in both ears.
 - Existing files of the same name are overwritten. A run that fails writes no files.
 - Tags and cover art are not copied.

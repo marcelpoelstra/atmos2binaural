@@ -67,6 +67,12 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
     parser.add_argument("-o", "--output", metavar="OUTPUT_DIR", help="output folder")
     parser.add_argument("-f", "--format", choices=("flac", "wav"), default="flac", help="output format (default flac)")
     parser.add_argument(
+        "--hrtf",
+        choices=("synthetic", "kemar"),
+        default="synthetic",
+        help="head model: synthetic (default) or the measured KEMAR head",
+    )
+    parser.add_argument(
         "--allow-damaged",
         action="store_true",
         help="convert damaged streams anyway and report them",
@@ -147,12 +153,12 @@ def check_stream(track: Path) -> list[str]:
     return [line for line in stderr.splitlines() if DAMAGE_PATTERN.search(line)]
 
 
-def orender_command(track: Path, f32: Path, tmp: Path) -> list[str]:
+def orender_command(track: Path, f32: Path, tmp: Path, hrtf: str = "synthetic") -> list[str]:
     return [
         str(DEPS / "bin" / "orender"), "render", str(track),
         "--config", str(tmp / "orender.yaml"),
         "--bridge-path", str(DEPS / "lib" / PLUGIN),
-        "--output-mode", "binaural",
+        "--output-mode", "binaural", "--hrir-source", hrtf,
         "--output-backend", "file", "--output-file", str(f32), "--output-file-format", "raw_f32",
         "--binaural-lfe-gain-db", str(LFE_GAIN_DB), "--binaural-lfe-lowpass-hz", str(LFE_LOWPASS_HZ),
         "--loglevel", "warn",
@@ -163,39 +169,40 @@ def find_error_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if ERROR_LINE.match(line)]
 
 
-def render(track: Path, f32: Path, tmp: Path) -> list[str]:
+def render(track: Path, f32: Path, tmp: Path, hrtf: str = "synthetic") -> list[str]:
     """Render `track` to the float file `f32`; returns orender's ERROR lines."""
-    return find_error_lines(run(orender_command(track, f32, tmp)).stderr)
+    return find_error_lines(run(orender_command(track, f32, tmp, hrtf)).stderr)
 
 
-def measure(f32: Path, sample_rate: int) -> Measurement:
-    stderr = run(
-        [
-            "ffmpeg", "-hide_banner", "-nostats",
-            "-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo", "-i", str(f32),
-            "-af", "ebur128=peak=true", "-f", "null", "-",
-        ]
-    ).stderr
+def ebur128(inputs: list[str], filters: str = "ebur128=peak=true") -> Measurement:
+    stderr = run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-af", filters, "-f", "null", "-"]).stderr
     summary = stderr[stderr.rfind("Summary:"):]
     loudness = re.search(r"^\s+I:\s+(-?[\d.]+) LUFS", summary, re.M)
     peak = re.search(r"^\s+Peak:\s+(-?[\d.]+|-inf) dBFS", summary, re.M)
     if "Summary:" not in stderr or not loudness or not peak:
-        raise ConversionError(f"{f32}: no loudness summary from ffmpeg ebur128:\n{stderr.strip()}")
+        raise ConversionError(f"{inputs[-1]}: no loudness summary from ffmpeg ebur128:\n{stderr.strip()}")
     return Measurement(float(peak.group(1)), float(loudness.group(1)))
 
 
-def album_gain(peaks: list[float], ceiling: float = CEILING_DBTP) -> float:
-    """The gain that brings the highest true peak to `ceiling`; silent tracks
-    (-inf) do not count."""
-    audible = [p for p in peaks if p != float("-inf")]
-    return ceiling - max(audible) if audible else 0.0
+def measure(f32: Path, sample_rate: int) -> Measurement:
+    return ebur128(["-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo", "-i", str(f32)])
+
+
+def playback_loudness(track: Path) -> float:
+    """Integrated loudness of `track` as a stereo player plays it: FFmpeg's
+    stereo downmix, which is also what mpv, and with it IINA, outputs."""
+    return ebur128(["-i", str(track)], "aformat=channel_layouts=stereo,ebur128=peak=true").loudness_lufs
 
 
 def encode_command(f32: Path, sample_rate: int, gain_db: float, fmt: str, dest: Path) -> list[str]:
     codec = ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"] if fmt == "flac" else ["-c:a", "pcm_s24le"]
+    # The limiter runs at four times the rate, so it holds true peaks, not only samples, to the ceiling.
+    limit = 10 ** (CEILING_DBTP / 20)
     return [
         "ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo",
-        "-i", str(f32), "-af", f"volume={gain_db:.4f}dB:precision=float",
+        "-i", str(f32),
+        "-af", f"volume={gain_db:.4f}dB:precision=float,aresample={4 * sample_rate},"
+        f"alimiter=limit={limit:.6f}:level=false:latency=true,aresample={sample_rate}",
         *codec,
         str(dest),
     ]
@@ -229,28 +236,27 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise ConversionError(f"{track}: damaged stream: {damage[0]}")
             f32 = tmp / f"{n}.f32"
             started = time.monotonic()
-            errors = render(track, f32, tmp)
+            errors = render(track, f32, tmp, args.hrtf)
             seconds = time.monotonic() - started
             if errors and not args.allow_damaged:
                 raise ConversionError(f"{track}: damaged stream: {errors[0]}")
             damage += errors
-            levels = measure(f32, rate)
+            loudness = measure(f32, rate).loudness_lufs
+            source = playback_loudness(track)
+            gain = source - loudness
             line = (
-                f"{n}/{len(tracks)} {track.stem}: {seconds:.1f} s, "
-                f"{levels.true_peak_dbtp:.1f} dBTP, {levels.loudness_lufs:.1f} LUFS"
+                f"{n}/{len(tracks)} {track.stem}: {seconds:.1f} s, {source:.1f} LUFS, gain {gain:+.1f} dB"
             )
             if damage:
                 damaged += 1
                 line += f", damaged: {damage[0]}"
             print(line, flush=True)
-            rendered.append((track, f32, rate, levels))
+            rendered.append((track, f32, rate, gain))
 
-        gain = album_gain([levels.true_peak_dbtp for *_, levels in rendered])
-        print(f"album gain {gain:.2f} dB")
         if damaged:
             print(f"damaged tracks: {damaged}")
         encoded = []
-        for track, f32, rate, _ in rendered:
+        for track, f32, rate, gain in rendered:
             dest = tmp / output_name(track, args.format)
             encode(f32, rate, gain, args.format, dest)
             f32.unlink()
