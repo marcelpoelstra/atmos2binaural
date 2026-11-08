@@ -1,0 +1,73 @@
+name: docker-image
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/marcelpoelstra/atmos2binaural
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { platform: linux/amd64, arch: amd64, runner: ubuntu-24.04 }
+          - { platform: linux/arm64, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Build and run the tests
+        run: docker buildx build --platform ${{ matrix.platform }} --target test .
+      - name: Push the image by digest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          docker buildx build --platform ${{ matrix.platform }} \
+            --output "type=image,name=$IMAGE,push-by-digest=true,push=true" \
+            --metadata-file "$RUNNER_TEMP/metadata.json" .
+          sed -n 's/.*"containerimage.digest": *"\([^"]*\)".*/\1/p' \
+            "$RUNNER_TEMP/metadata.json" > "$RUNNER_TEMP/digest"
+      - if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digest
+          overwrite: true
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8.0.2
+        with: { name: digest-amd64, path: amd64 }
+      - uses: actions/download-artifact@v8.0.2
+        with: { name: digest-arm64, path: arm64 }
+      - uses: docker/setup-buildx-action@v4.4.1
+      - name: Tag both architectures
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create -t "$IMAGE:$version" -t "$IMAGE:latest" \
+            "$IMAGE@$(cat amd64/digest)" "$IMAGE@$(cat arm64/digest)"

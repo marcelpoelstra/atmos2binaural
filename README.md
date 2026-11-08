@@ -21,6 +21,23 @@ Debian and Ubuntu:
 sudo apt install ffmpeg python3 git build-essential pkg-config clang libclang-dev libpipewire-0.3-dev
 ```
 
+With Docker you need only Docker. macOS:
+
+```bash
+brew install colima docker docker-buildx
+colima start
+```
+
+Then add the `cliPluginsExtraDirs` entry that `brew info docker-buildx` shows to `~/.docker/config.json`, so that Docker finds buildx. colima shares only your home folder with Docker. For music in other folders, see [colima's FAQ](https://github.com/abiosoft/colima/blob/main/docs/FAQ.md#issue-with-docker-bind-mount-showing-empty).
+
+Debian and Ubuntu:
+
+```bash
+sudo apt install docker.io docker-buildx
+```
+
+To run Docker without `sudo` on Linux, follow Docker's [Linux post-installation steps](https://docs.docker.com/engine/install/linux-postinstall/).
+
 ## Install
 
 ```bash
@@ -30,6 +47,34 @@ scripts/build-deps.sh
 ```
 
 `scripts/build-deps.sh` downloads and builds the renderer and the TrueHD decoder into `deps/`. It takes a few minutes and is needed once.
+
+### Install with Docker
+
+Add this function to `~/.zshrc` or `~/.bashrc`, then open a new terminal:
+
+```bash
+atmos2binaural() {
+  BASE_IMAGE=ghcr.io/marcelpoelstra/atmos2binaural
+  case $1 in
+    1.[0-9]*.[0-9]* ) IMAGE=${BASE_IMAGE}:$1; shift ;;
+    * ) IMAGE=${BASE_IMAGE}:latest; docker pull $IMAGE ;;
+  esac
+  docker run --rm -it -v "${PWD}":/data --workdir /data $IMAGE "$@"
+}
+```
+
+The function runs the converter from the image `ghcr.io/marcelpoelstra/atmos2binaural`. Without a version as the first argument, it first pulls the latest image.
+
+To build the image yourself:
+
+```bash
+git clone https://github.com/marcelpoelstra/atmos2binaural.git
+cd atmos2binaural
+git checkout v1.0.0
+docker build -t ghcr.io/marcelpoelstra/atmos2binaural:1.0.0 .
+```
+
+Then pass `1.0.0` as the first argument, as the Usage section shows.
 
 ## Usage
 
@@ -52,6 +97,21 @@ You can pass several files and folders; a folder contributes the `.thd` files di
 
 ```bash
 ./atmos2binaural.py -f wav -o ~/Converted track01.thd track02.thd
+```
+
+### Usage with Docker
+
+The container sees only the current folder. Run `atmos2binaural` in the folder that holds the album folders, and pass paths relative to it:
+
+```bash
+cd ~/Music
+atmos2binaural "My Atmos Album"
+```
+
+This writes `~/Music/My Atmos Album (binaural)/`. The options are the same as above. A version as the first argument runs that image instead of the latest:
+
+```bash
+atmos2binaural 1.0.0 "My Atmos Album"
 ```
 
 ## Output
@@ -81,6 +141,10 @@ With `--allow-damaged` it is converted anyway; it comes out shorter where the de
 | `no .thd files in <folder>` | Point to the folder that holds the `.thd` files |
 | `<file> and <file> share the output name <name>` | Two inputs would write the same output file; rename one of them |
 | `... No such file or directory: 'ffprobe'` | Install FFmpeg |
+| `<path>: no such file or folder` | Check the path. With Docker, give the path relative to the current folder |
+| `<folder>: outside /data, the current folder as the container sees it; run atmos2binaural in the folder that holds the album folders` | With Docker: run the command in the folder that holds the album folders, and keep `-o` relative to the current folder |
+| `failed to connect to the docker API at ...; check if the path is correct and if the daemon is running` | Start Docker: on macOS with `colima start`, on Linux by starting the Docker service |
+| `cannot attach stdin to a TTY-enabled container because stdin is not a terminal` | With Docker: run the command in a terminal; its input cannot come from a pipe or a file |
 
 ## Licence
 
