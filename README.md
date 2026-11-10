@@ -1,8 +1,10 @@
 # atmos2binaural
 
 A personal frustration led to creating this solution.
-Anyone having nice BluRay music discs with surround and Atmos mixes, will have the same frustration of not being able to play these surround versions on the go. But when you rip the TrueHD source filed from the original Blu-ray (What's needed for that: Google is your friend) 
-I created a solution that converts and down mixes them in proper 2channel binaural audio that can be played over headphones (think your portable music player or smartphone) while retaining much of the surround sound features.  It even plays great on just stereo speakers, however don't expect spectacular difference with the familiar stereo versions of the music.
+Anyone having nice BluRay music discs with surround and Atmos mixes, will have the same frustration of not being able to play these surround versions on the go. 
+But when you rip the TrueHD source files from the original Blu-ray (What's needed for that: Google is your friend) 
+I created a solution that converts and down mixes them in proper 2channel binaural audio that can be played over headphones (think your portable music player or smartphone) while retaining much of the surround sound features.  
+It even plays great on just stereo speakers, however don't expect spectacular difference with the familiar stereo versions of the music.
 
 # How does this work?
 
