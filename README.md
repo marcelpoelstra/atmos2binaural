@@ -1,9 +1,16 @@
 # atmos2binaural
 
-Converts Dolby TrueHD files (`.thd`) to binaural stereo for headphones, as FLAC or WAV. Works with Dolby Atmos as well as plain 5.1 and 7.1, for a single track or a whole album. Runs on macOS and Linux.
+A personal frustration led to creating this solution.
+Anyone having nice BluRay music discs with surround and Atmos mixes, will have the same frustration of not being able to play these surround versions on the go. But when you rip the TrueHD source filed from the original Blu-ray (What's needed for that: Google is your friend) 
+I created a solution that converts and down mixes them in proper 2channel binaural audio that can be played over headphones (think your portable music player or smartphone) while retaining much of the surround sound features.  It even plays great on just stereo speakers, however don't expect spectacular difference with the familiar stereo versions of the music.
+
+# How does this work?
+
+atmos2 binaural Converts Dolby TrueHD files (`.thd`) to binaural stereo for headphones, as FLAC or WAV. Works with Dolby Atmos as well as plain 5.1 and 7.1, for a single track or a whole album. Runs on macOS and Linux.
 
 ## Requirements
 
+To build from sources:
 - Python 3.9 or newer
 - FFmpeg 6.1 or newer
 - For the one-time dependency build: git, a C compiler and [Rust](https://rustup.rs) 1.95 or newer
@@ -21,7 +28,9 @@ Debian and Ubuntu:
 sudo apt install ffmpeg python3 git build-essential pkg-config clang libclang-dev libpipewire-0.3-dev
 ```
 
-With Docker you need only Docker. macOS:
+For building your own container you need only Docker. 
+
+macOS:
 
 ```bash
 brew install colima docker docker-buildx
@@ -48,7 +57,7 @@ scripts/build-deps.sh
 
 `scripts/build-deps.sh` downloads and builds the renderer and the TrueHD decoder into `deps/`. It takes a few minutes and is needed once.
 
-### Install with Docker
+### Install with Docker (recommended for most users)
 
 Add this function to `~/.zshrc` or `~/.bashrc`, then open a new terminal:
 
@@ -63,7 +72,8 @@ atmos2binaural() {
 }
 ```
 
-The function runs the converter from the image `ghcr.io/marcelpoelstra/atmos2binaural`. Without a version as the first argument, it first pulls the latest image.
+The function runs the converter from the image `ghcr.io/marcelpoelstra/atmos2binaural`. 
+Without a version as the first argument, it first pulls the latest image.
 
 To build the image yourself:
 
@@ -101,14 +111,17 @@ You can pass several files and folders; a folder contributes the `.thd` files di
 
 ### Usage with Docker
 
-The container sees only the current folder. Run `atmos2binaural` in the folder that holds the album folders, and pass paths relative to it:
+The container sees only the current folder. 
+Run `atmos2binaural` in the folder that holds the album folders, and pass paths relative to it:
 
 ```bash
 cd ~/Music
 atmos2binaural "My Atmos Album"
 ```
 
-This writes `~/Music/My Atmos Album (binaural)/`. The options are the same as above. A version as the first argument runs that image instead of the latest:
+This writes `~/Music/My Atmos Album (binaural)/`. 
+The options are the same as above. 
+A version as the first argument runs that image instead of the latest:
 
 ```bash
 atmos2binaural 1.0.0 "My Atmos Album"
