@@ -2,9 +2,13 @@
 
 atmos2binaural grew out of a personal frustration. Many music Blu-ray discs carry surround and Dolby Atmos mixes. Anyone who owns such discs shares that frustration: you cannot play those surround versions on the go.
 
-You first rip the TrueHD files from the original Blu-ray; a web search shows how. atmos2binaural then converts and downmixes them to 2-channel binaural audio, which keeps much of the surround sound. You can play the result on headphones from a portable music player or a smartphone. It even sounds great on plain stereo speakers, but do not expect a spectacular difference from the familiar stereo versions of the music.
+You first need to rip the raw TrueHD files (.thd) from the original Blu-ray (instructions not provided for obvious reasons, Google is your friend) 
+atmos2binaural then converts and downmixes them to 2-channel binaural audio, which keeps much of the surround sound. 
+You can listen to the result on headphones from a portable music player or a smartphone. 
+It even sounds great on plain stereo speakers, but do not expect a spectacular difference from the familiar stereo versions of the music in that case.
 
-atmos2binaural reads Dolby TrueHD files (`.thd`) with Dolby Atmos, 7.1 or 5.1 audio, and writes FLAC or WAV files. It converts a single track or a whole album, and runs on macOS and Linux.
+atmos2binaural reads Dolby TrueHD files (`.thd`) with Dolby Atmos, 7.1 or 5.1 audio, and writes FLAC or WAV files. 
+It converts a single track or a whole album, and runs on macOS and Linux.
 
 ## Installation
 
@@ -12,7 +16,7 @@ You can run atmos2binaural with Docker, which is recommended for most users, or 
 
 ### With Docker (recommended)
 
-On macOS, install Docker with colima:
+On macOS, you can use Docker Desktop, or alternatively install Docker with colima:
 
 ```bash
 brew install colima docker docker-buildx
@@ -53,13 +57,15 @@ git checkout v<version>
 docker build -t ghcr.io/marcelpoelstra/atmos2binaural:<version> .
 ```
 
-Then give that version number as the first argument when you run the command, as shown under Usage with Docker.
+Then give that version number as the first argument when you run the command, as shown further below under Usage with Docker.
 
 ### From source
 
-You need Python 3.9 or newer and FFmpeg 6.1 or newer. The one-time build of the renderer and the decoder also needs git, a C compiler and Rust 1.95 or newer.
+You need Python 3.9 or newer and FFmpeg 6.1 or newer. 
+The one-time build of the renderer and the decoder also needs git, a C compiler and Rust 1.95 or newer.
 
-On macOS, the Command Line Tools provide Python, git and the compiler. Homebrew provides FFmpeg and Rust:
+On macOS, the Command Line Tools provide Python, git and the compiler. 
+Homebrew provides FFmpeg and Rust:
 
 ```bash
 xcode-select --install
@@ -83,7 +89,8 @@ cd atmos2binaural
 scripts/build-deps.sh
 ```
 
-`scripts/build-deps.sh` downloads and builds the renderer and the TrueHD decoder into `deps/`. This takes a few minutes. Run it again after every update of atmos2binaural.
+`scripts/build-deps.sh` downloads and builds the renderer and the TrueHD decoder into `deps/`. 
+This takes a few minutes. Run it again after every new version update of atmos2binaural.
 
 ## Usage
 
@@ -93,20 +100,26 @@ In the `atmos2binaural` folder, convert an album by giving its folder:
 ./atmos2binaural.py "/Music/My Atmos Album"
 ```
 
-This creates the folder `/Music/My Atmos Album (binaural)/` with one FLAC file per track, named after the original files.
+This creates the folder `/Music/My Atmos Album (binaural)/` with one FLAC or WAV file per track, named after the original files.
 
-You can also give single `.thd` files, or several files and folders at once. From a folder, atmos2binaural takes the `.thd` files directly inside it; it does not search subfolders. Without `-o`, the output goes to a folder next to the album folder, named `<album folder> (binaural)`. For single files, the album folder is the folder that holds the first file.
+You can also give single `.thd` files, or several files and folders at once. 
+From a folder, atmos2binaural takes the `.thd` files directly inside it, it does not search subfolders. 
+Without `-o`, the output goes to a folder next to the album folder, named `<album folder> (binaural)`. 
+For single files, the album folder is the folder that holds the first file.
 
 ### Usage with Docker
 
-With Docker, the command is `atmos2binaural`, without `./` and `.py`. The container sees only the current folder and the folders inside it. Change to the folder that holds your album folders, and give paths relative to it:
+With Docker, the command is `atmos2binaural`, without `./` and `.py`. 
+The container sees only the current folder and the folders inside it. 
+Change to the folder that holds your album folders, and give paths relative to it:
 
 ```bash
 cd ~/Music
 atmos2binaural "My Atmos Album"
 ```
 
-This creates `~/Music/My Atmos Album (binaural)/`. The options below work the same way. A folder given with `-o` must also lie inside the current folder.
+This creates `~/Music/My Atmos Album (binaural)/`. 
+The options below work the same way. A folder given with `-o` must also lie inside the current folder.
 
 To run a specific version of the image, give its number first:
 
@@ -138,16 +151,22 @@ You can combine any of these options. Leave an option out to keep its default.
 
 ### Levels
 
-`--centre`, `--surround` and `--height` add to the levels of the chosen preset. `--preset fold-down` on its own plays the surround channels 3 dB softer than the front. With `--preset fold-down --surround 2`, they play 1 dB softer. Each total level, the preset's part included, is capped at 24 dB up or down.
+`--centre`, `--surround` and `--height` add to the levels of the chosen preset. 
+`--preset fold-down` on its own plays the surround channels 3 dB softer than the front. 
+With `--preset fold-down --surround 2`, they play 1 dB softer. 
+Each total level, the preset's part included, is capped at 24 dB up or down.
 
 ### Head models
 
-`synthetic` colours the sound the least. `kemar` is based on measurements of a dummy head. It gives more front, back and height cues, but less bass and a brighter sound. The choice matters most with the `fold-down` preset, because `dolby` uses the head model for only 15% of the sound.
+`synthetic` colours the sound the least. 
+`kemar` is based on measurements of a dummy head. 
+It gives more front, back and height cues, but less bass and a brighter sound. 
+The choice matters most with the `fold-down` preset, because `dolby` uses the head model for only 15% of the sound.
 
 ### Examples
 
 ```bash
-# Make the centre 3 dB louder, for a lead vocal that sounds far away
+# Make the centre 3 dB louder, e.g. for a centred lead vocal that sounds too far away
 ./atmos2binaural.py --centre 3 "/Music/My Atmos Album"
 
 # Stereo downmix balance with even softer surrounds, as WAV files in ~/Converted
@@ -159,19 +178,23 @@ You can combine any of these options. Leave an option out to keep its default.
 
 ## Output
 
-atmos2binaural writes 24-bit FLAC or WAV files at the sample rate of the source. Each track plays as loud as its TrueHD file does in a stereo player such as IINA. A limiter keeps the peaks at or below -1 dBTP. The LFE (subwoofer) channel is included, in both ears.
+atmos2binaural writes 24-bit FLAC or WAV files at the sample rate of the source. 
+Each track plays as loud as its TrueHD file does in a stereo player such as IINA. 
+A limiter keeps the peaks at or below -1 dBTP. The LFE (subwoofer) channel is included, in both ears.
 
 Existing files with the same name are overwritten. A run that fails writes no files. Tags and cover art are not copied.
 
 ## Damaged files
 
-Before converting, atmos2binaural checks every track with the TrueHD decoder. A damaged track stops the run with a message such as:
+Before converting, atmos2binaural checks every track with the TrueHD decoder. 
+A damaged track stops the run with a message such as:
 
 ```text
 atmos2binaural: /Music/My Atmos Album/01.thd: damaged stream: [...] Parse error at frame 20445: ...
 ```
 
-With `--allow-damaged`, damaged tracks are converted anyway. They come out shorter where the decoder dropped audio, and the run ends with `damaged tracks: <count>`.
+With `--allow-damaged`, damaged tracks are converted anyway. 
+They come out shorter where the decoder dropped audio, and the run ends with `damaged tracks: <count>`.
 
 ## Troubleshooting
 
@@ -191,4 +214,5 @@ With `--allow-damaged`, damaged tracks are converted anyway. They come out short
 
 ## Licence
 
-atmos2binaural is licensed under GPL-3.0-or-later; see `LICENSE`. The `harletty` decoder that `scripts/build-deps.sh` builds is licensed under LGPL-3.0.
+atmos2binaural is licensed under GPL-3.0-or-later; see `LICENSE`. 
+The `harletty` decoder that `scripts/build-deps.sh` builds is licensed under LGPL-3.0.
