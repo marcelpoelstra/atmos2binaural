@@ -105,7 +105,8 @@ This creates the folder `/Music/My Atmos Album (binaural)/` with one FLAC or WAV
 You can also give single `.thd` files, or several files and folders at once. 
 From a folder, atmos2binaural takes the `.thd` files directly inside it, it does not search subfolders. 
 Without `-o`, the output goes to a folder next to the album folder, named `<album folder> (binaural)`. 
-For single files, the album folder is the folder that holds the first file.
+For single files, the album folder is the folder that holds the first file. 
+With `-o FOLDER`, the output goes to that folder, which is created if needed.
 
 ### Usage with Docker
 
@@ -131,33 +132,44 @@ atmos2binaural 1.0.0 "My Atmos Album"
 
 You can combine any of these options. Leave an option out to keep its default.
 
-| Option | Possible values | Default | Effect |
+| Option | Values | Default | Effect |
 | --- | --- | --- | --- |
-| `-o FOLDER` | a folder | `<album folder> (binaural)`, next to the album folder | Writes the output files to `FOLDER`, and creates the folder if needed |
-| `-f FORMAT` | `flac` or `wav` | `flac` | Sets the format of the output files |
-| `--preset NAME` | `dolby` or `fold-down` | `dolby` | Sets the balance between the channels (see Presets) |
-| `--centre DB` | a number of decibels, such as `3` or `-2` | `0` | Makes the centre louder with a positive number, or softer with a negative one. The centre is the centre channel and anything straight in front of you, such as a lead vocal |
-| `--surround DB` | as for `--centre` | `0` | Does the same for the side and rear channels: anything beside or behind you |
-| `--height DB` | as for `--centre` | `0` | Does the same for the height channels: anything above you |
-| `--hrtf NAME` | `synthetic` or `kemar` | `synthetic` | Selects the head model that places the sound around your head (see Head models) |
-| `--allow-damaged` | no value | off | Converts damaged tracks anyway (see Damaged files) |
+| `-o FOLDER` | any folder | see Usage | output folder |
+| `-f FORMAT` | `flac`, `wav` | `flac` | output format |
+| `--preset NAME` | `dolby`, `fold-down` | `dolby` | channel balance |
+| `--centre DB` | dB, e.g. `3` or `-2` | `0` | centre level |
+| `--surround DB` | dB, e.g. `3` or `-2` | `0` | side and rear level |
+| `--height DB` | dB, e.g. `3` or `-2` | `0` | height level |
+| `--hrtf NAME` | `synthetic`, `kemar` | `synthetic` | head model |
+| `--allow-damaged` | none | off | converts damaged tracks |
+
+The sections below explain the presets, the levels and the head models in more detail. 
+Damaged tracks are covered further below under Damaged files.
 
 ### Presets
 
-| Preset | Sound |
-| --- | --- |
-| `dolby` | Every channel keeps its own level. The sound is mostly plain stereo panning, with the head model contributing 15% |
-| `fold-down` | Balanced like a stereo downmix of the surround mix: the surround channels play 3 dB softer than the front. The head model shapes the whole sound |
+| Preset | Channel levels | Stereo panning | Head model |
+| --- | --- | --- | --- |
+| `dolby` (default) | as in the mix | 85% | 15% |
+| `fold-down` | surround channels -3 dB | 0% | 100% |
+
+The percentages show how much of the sound goes through plain stereo panning and how much through the head model. 
+`fold-down` plays the surround channels 3 dB softer than the front, like a stereo downmix of the surround mix.
 
 ### Levels
 
-`--centre`, `--surround` and `--height` add to the levels of the chosen preset. 
+`--centre` covers the centre channel and anything straight in front of you, e.g. a centred lead vocal. 
+`--surround` covers the side and rear channels: anything beside or behind you. 
+`--height` covers the height channels: anything above you. 
+A positive number makes that part louder, and a negative number makes it softer. 
+These levels add to the levels of the chosen preset. 
 `--preset fold-down` on its own plays the surround channels 3 dB softer than the front. 
 With `--preset fold-down --surround 2`, they play 1 dB softer. 
 Each total level, the preset's part included, is capped at 24 dB up or down.
 
 ### Head models
 
+The head model places the sound around your head. 
 `synthetic` colours the sound the least. 
 `kemar` is based on measurements of a dummy head. 
 It gives more front, back and height cues, but less bass and a brighter sound. 
