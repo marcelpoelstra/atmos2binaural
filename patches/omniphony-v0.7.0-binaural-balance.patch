@@ -1,0 +1,789 @@
+diff --git a/docs/live-options-registry.md b/docs/live-options-registry.md
+index 2e7bf00..108f242 100644
+--- a/docs/live-options-registry.md
++++ b/docs/live-options-registry.md
+@@ -131,6 +131,9 @@ Declared options (`renderer::options::LIVE_OPTIONS`):
+ | `binaural_head_radius_m` | float [0.05, 0.15], step 0.001 | `0.0875` | — | — | `/control/binaural/head_radius` |
+ | `binaural_lfe_gain_db` | float [-24, 12], step 0.1 | `-3.0103` | — | — | — |
+ | `binaural_lfe_lowpass_hz` | int or null [20, 500] | unset | — | — | — |
++| `binaural_hrtf_share` | float [0, 1], step 0.01 | `1` | — | — | — |
++| `binaural_direction_normalize` | bool | `false` | — | — | — |
++| `binaural_zone_gains_db` | 3 floats [-24, 24], step 0.1 | `[0, 0, 0]` | — | — | — |
+ | `binaural_air_absorption` | bool | `true` | — | — | `/control/binaural/air_absorption` |
+ | `binaural_diffuse_field_eq` | bool | `false` | — | — | `/control/binaural/diffuse_field_eq` |
+ | `binaural_sphere_coordinates` | bool | `false` | — | — | `/control/binaural/sphere_coordinates` |
+diff --git a/docs/osc-control-contract.md b/docs/osc-control-contract.md
+index 7916837..accd694 100644
+--- a/docs/osc-control-contract.md
++++ b/docs/osc-control-contract.md
+@@ -489,6 +489,9 @@ dedicated address, under `/omniphony`):
+ | `binaural_head_radius_m` | float [0.05, 0.15], step 0.001 | `0.0875` | — | — | `/control/binaural/head_radius` |
+ | `binaural_lfe_gain_db` | float [-24, 12], step 0.1 | `-3.0103` | — | — | — |
+ | `binaural_lfe_lowpass_hz` | int or null [20, 500] | unset | — | — | — |
++| `binaural_hrtf_share` | float [0, 1], step 0.01 | `1` | — | — | — |
++| `binaural_direction_normalize` | bool | `false` | — | — | — |
++| `binaural_zone_gains_db` | 3 floats [-24, 24], step 0.1 | `[0, 0, 0]` | — | — | — |
+ | `binaural_air_absorption` | bool | `true` | — | — | `/control/binaural/air_absorption` |
+ | `binaural_diffuse_field_eq` | bool | `false` | — | — | `/control/binaural/diffuse_field_eq` |
+ | `binaural_sphere_coordinates` | bool | `false` | — | — | `/control/binaural/sphere_coordinates` |
+diff --git a/omniphony-renderer/renderer/src/binaural/mod.rs b/omniphony-renderer/renderer/src/binaural/mod.rs
+index 15bef90..c5c716d 100644
+--- a/omniphony-renderer/renderer/src/binaural/mod.rs
++++ b/omniphony-renderer/renderer/src/binaural/mod.rs
+@@ -129,6 +129,89 @@ impl LfeLowpass {
+         self.stages = [BiquadState::default(); 2];
+     }
+ }
++
++/// How the direct path balances its sources. The default renders as the
++/// path always did: the HRTF alone, each direction at its own level, no
++/// offsets.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct DirectBalance {
++    /// Share of the HRTF render in each source's direct sound, 0 to 1; the
++    /// rest is amplitude-panned between the ears ([`pan_gains`]). The
++    /// reflections and the reverb keep their own level.
++    pub hrtf_share: f32,
++    /// Scale each direction's HRIR pair to the energy of the pair at 30° to
++    /// the front, ear level, so that every direction reaches the ears at one
++    /// power.
++    pub normalize: bool,
++    /// Offsets in dB of the centre, surround and height zones
++    /// ([`zone_weights`]), applied to a source in proportion to how far it
++    /// sits in each.
++    pub zone_gains_db: [f32; 3],
++}
++
++impl Default for DirectBalance {
++    fn default() -> Self {
++        Self {
++            hrtf_share: 1.0,
++            normalize: false,
++            zone_gains_db: [0.0; 3],
++        }
++    }
++}
++
++impl DirectBalance {
++    /// Linear gain of a source at `pos` from the zone offsets.
++    fn zone_gain(&self, pos: [f64; 3]) -> f32 {
++        if self.zone_gains_db == [0.0; 3] {
++            return 1.0;
++        }
++        let db: f32 = zone_weights(pos)
++            .iter()
++            .zip(self.zone_gains_db)
++            .map(|(w, g)| w * g)
++            .sum();
++        crate::dsp::db::db_to_linear(db)
++    }
++}
++
++/// How far a source at `pos` (world ADM position) sits in the centre, the
++/// surround and the height zone, each 0 to 1, from its direction:
++/// - height: the elevation over 30°, capped at 1;
++/// - surround: 0 within 45° of the front, 1 from 90° on, linear between;
++/// - centre: 1 straight ahead, 0 from 30° on, linear between, shrinking as
++///   the height weight grows.
++pub(crate) fn zone_weights(pos: [f64; 3]) -> [f32; 3] {
++    let [x, y, z] = pos;
++    let norm = (x * x + y * y + z * z).sqrt();
++    if norm < 1e-9 {
++        return [0.0; 3];
++    }
++    let el = (z / norm).clamp(-1.0, 1.0).asin().to_degrees();
++    let az = x.atan2(y).to_degrees().abs();
++    let height = (el / 30.0).clamp(0.0, 1.0);
++    let surround = ((az - 45.0) / 45.0).clamp(0.0, 1.0);
++    let centre = (1.0 - az / 30.0).clamp(0.0, 1.0) * (1.0 - height);
++    [centre as f32, surround as f32, height as f32]
++}
++
++/// Amplitude-panning gains `(left, right)` of a source at lateral position
++/// `lat` (the head-relative x of its unit direction, −1 left to +1 right):
++/// their difference over their sum is `lat / sin 30°`, clamped to a hard
++/// pan, at constant power. Straight ahead, each ear gets 0.707.
++pub(crate) fn pan_gains(lat: f32) -> (f32, f32) {
++    let r = (2.0 * lat).clamp(-1.0, 1.0);
++    let norm = (2.0 * (1.0 + r * r)).sqrt();
++    ((1.0 - r) / norm, (1.0 + r) / norm)
++}
++
++/// Energy of the first `len` taps of both ears of `pair`.
++fn pair_energy(pair: &HrirPair, len: usize) -> f32 {
++    pair.left[..len]
++        .iter()
++        .chain(&pair.right[..len])
++        .map(|v| v * v)
++        .sum()
++}
+ use crate::live_params::{BinauralReflections, BinauralReverb};
+ use convolver::EarConvolver;
+ use hrir::{DirectionKey, HRIR_LEN, HrirPair, HrirSet, ParametricPinnaHrir};
+@@ -360,7 +443,9 @@ struct ChannelDsp {
+     /// HRIR grid generation they came out of — a live source switch replaces
+     /// the grid under us, and a key alone would then match across two
+     /// different datasets and freeze the stale kernels in place.
+-    last_dir: Option<(u32, DirectionKey)>,
++    /// The third member is whether the kernels were level-matched
++    /// ([`DirectBalance::normalize`]): switching that rebuilds them too.
++    last_dir: Option<(u32, DirectionKey, bool)>,
+     /// Samples of silence still to run through this state once the channel
+     /// has gone silent. Every block that carries signal rearms it; a silent
+     /// block runs the DSP on zeros and counts it down; at zero the channel
+@@ -470,6 +555,8 @@ pub struct BinauralFrameParams {
+     pub hrir_update_lattice: crate::live_params::HrirUpdateLattice,
+     /// How the direct buses (the LFE) reach each ear.
+     pub direct_feed: DirectFeed,
++    /// How the direct path balances its sources.
++    pub balance: DirectBalance,
+ }
+ 
+ /// What the last HRIR grid build produced, for the control surface.
+@@ -591,6 +678,10 @@ pub struct BinauralRenderer {
+     /// Bumped every time a rebuilt grid is swapped in, so the per-channel
+     /// direction cache cannot match across two different datasets.
+     hrir_generation: u32,
++    /// Energy of the front HRIR pair the level match aims at, with the grid
++    /// generation and the lattice it was taken on (see
++    /// [`Self::front_energy`]).
++    front_energy: Option<(u32, Option<i32>, f32)>,
+     /// Shared late-reverb tail. Allocated with the renderer; cleared in
+     /// place when the reverb is switched off.
+     fdn: Fdn,
+@@ -676,6 +767,7 @@ impl BinauralRenderer {
+                 right: [0.0; HRIR_LEN],
+             },
+             hrir_generation: 0,
++            front_energy: None,
+             fdn: Fdn::new(sample_rate),
+             fdn_live: false,
+             reverb_bus_l: Vec::with_capacity(REVERB_BUS_CAPACITY),
+@@ -683,6 +775,24 @@ impl BinauralRenderer {
+         }
+     }
+ 
++    /// Energy of the active grid's HRIR pair at 30° to the front, ear level,
++    /// on `lattice`: the level [`DirectBalance::normalize`] matches every
++    /// direction to. Taken once per grid and lattice.
++    fn front_energy(&mut self, lattice: crate::live_params::HrirUpdateLattice) -> f32 {
++        let subdiv = lattice.subdiv();
++        if let Some((generation, sub, energy)) = self.front_energy
++            && generation == self.hrir_generation
++            && sub == subdiv
++        {
++            return energy;
++        }
++        let key = self.hrir.set.quantize_direction(30.0, 0.0, subdiv);
++        self.hrir.set.at_key(key, &mut self.hrir_scratch);
++        let energy = pair_energy(&self.hrir_scratch, self.hrir.set.len());
++        self.front_energy = Some((self.hrir_generation, subdiv, energy));
++        energy
++    }
++
+     /// Build requested grids on the calling thread, inside
+     /// [`Self::ensure_source`], so a source change takes effect on the very
+     /// frame that requests it.
+@@ -939,11 +1049,18 @@ impl BinauralRenderer {
+             air_absorption,
+             hrir_update_lattice,
+             direct_feed,
++            balance,
+         } = *params;
+         debug_assert_eq!(out.len(), sample_length * 2);
+         if sample_length == 0 || (input_channel_count == 0 && extra.is_none()) {
+             return;
+         }
++        // The level every direction is matched to, when it is.
++        let front_energy = balance
++            .normalize
++            .then(|| self.front_energy(hrir_update_lattice));
++        let share = balance.hrtf_share;
++        let panning = share < 1.0;
+         // The extra source gets a DSP slot of its own — its convolvers, delay
+         // lines and reflection bank persist across blocks like any channel's,
+         // and that continuity is what lets it move without clicking.
+@@ -992,6 +1109,9 @@ impl BinauralRenderer {
+         let mut dry = [0.0f32; EAR_RUN];
+         let mut ear_l = [0.0f32; EAR_RUN];
+         let mut ear_r = [0.0f32; EAR_RUN];
++        // The air-absorbed signal of the run, which the amplitude-panned share
++        // takes (see `DirectBalance::hrtf_share`).
++        let mut flat = [0.0f32; EAR_RUN];
+ 
+         for c in 0..source_count {
+             // Past the input channels sits the extra source (the object test).
+@@ -1077,6 +1197,13 @@ impl BinauralRenderer {
+                 Some(e) => e.position,
+                 None => chan_pos.get(c).copied().unwrap_or([0.0, 1.0, 0.0]),
+             };
++            // The zone offsets act as an input trim: the direct sound, the
++            // reflections and the reverb send all take them.
++            let zone = balance.zone_gain(pos);
++            let gain = ChannelGain {
++                start: gain.start * zone,
++                step: gain.step * zone,
++            };
+ 
+             // World → head-relative direction, then spherical angles.
+             let hp = head_pose.rotate(pos);
+@@ -1084,6 +1211,22 @@ impl BinauralRenderer {
+             let az_rad = hx.atan2(hy); // 0 = front, + = right
+             let horiz = (hx * hx + hy * hy).sqrt();
+             let el_rad = hz.atan2(horiz);
++            // Lateral position of the direction, head-relative: −1 at the
++            // left ear, +1 at the right.
++            let lat = {
++                let norm = (hx * hx + hy * hy + hz * hz).sqrt();
++                if norm > 1e-6 {
++                    (hx / norm).clamp(-1.0, 1.0)
++                } else {
++                    0.0
++                }
++            };
++            let (pan_l, pan_r) = if panning {
++                let (l, r) = pan_gains(lat);
++                ((1.0 - share) * l, (1.0 - share) * r)
++            } else {
++                (0.0, 0.0)
++            };
+ 
+             // Isotropic distance scale → metric distance (m). Direction is
+             // scale-invariant. Object/bed levels are authored upstream (Atmos
+@@ -1123,6 +1266,7 @@ impl BinauralRenderer {
+                     el_rad.to_degrees(),
+                     hrir_update_lattice.subdiv(),
+                 ),
++                balance.normalize,
+             );
+             let rate = self.sample_rate;
+             let dsp = if in_extra_slot {
+@@ -1135,11 +1279,24 @@ impl BinauralRenderer {
+             if dsp.last_dir != Some(dir) {
+                 dsp.last_dir = Some(dir);
+                 self.hrir.set.at_key(dir.1, &mut self.hrir_scratch);
++                let len = self.hrir.set.len();
++                // Level match: the pair scaled to the front pair's energy.
++                // Scaling the kernels lets the crossfade below carry the
++                // change, as it carries any other.
++                if let Some(front) = front_energy {
++                    let energy = pair_energy(&self.hrir_scratch, len);
++                    if energy > 0.0 {
++                        let g = (front / energy).sqrt();
++                        let pair = &mut self.hrir_scratch;
++                        for v in pair.left[..len].iter_mut().chain(&mut pair.right[..len]) {
++                            *v *= g;
++                        }
++                    }
++                }
+                 // Kernel changes (moving object / head) crossfade over the
+                 // block — capped at HRIR_LEN samples for large offline blocks
+                 // — so the transfer function never jumps at a block boundary
+                 // (issue #155).
+-                let len = self.hrir.set.len();
+                 let fade = sample_length.min(len);
+                 dsp.conv_l
+                     .set_coeffs_smooth(&self.hrir_scratch.left[..len], fade);
+@@ -1176,18 +1333,10 @@ impl BinauralRenderer {
+             // position (head-relative), at constant total send energy: a
+             // source in the median plane feeds both alike, one at the ear
+             // feeds that side's bus with √2 of the send.
+-            let (send_l, send_r) = {
+-                let norm = (hx * hx + hy * hy + hz * hz).sqrt();
+-                let lat = if norm > 1e-6 {
+-                    (hx / norm).clamp(-1.0, 1.0)
+-                } else {
+-                    0.0
+-                };
+-                (
+-                    reverb_send * (1.0 - lat).sqrt(),
+-                    reverb_send * (1.0 + lat).sqrt(),
+-                )
+-            };
++            let (send_l, send_r) = (
++                reverb_send * (1.0 - lat).sqrt(),
++                reverb_send * (1.0 + lat).sqrt(),
++            );
+ 
+             // ── Early reflections: per-block image-source update ─────────────
+             if reflections.enabled {
+@@ -1315,6 +1464,7 @@ impl BinauralRenderer {
+                         dsp.air_state += (raw - dsp.air_state) * (1.0 - air);
+                         raw = dsp.air_state;
+                     }
++                    flat[i] = raw;
+                     // Authored object/bed level is respected: no 1/d
+                     // attenuation.
+                     ear_l[i] = dsp.delay_l.process(raw);
+@@ -1329,6 +1479,10 @@ impl BinauralRenderer {
+                 for i in 0..n {
+                     let mut yl = ear_l[i];
+                     let mut yr = ear_r[i];
++                    if panning {
++                        yl = share * yl + pan_l * flat[i];
++                        yr = share * yr + pan_r * flat[i];
++                    }
+                     if reflections_on {
+                         let (rl, rr) = dsp.refl.process(dry[i]);
+                         yl += rl;
+@@ -1374,6 +1528,7 @@ mod tests {
+             air_absorption: false,
+             hrir_update_lattice: crate::live_params::HrirUpdateLattice::default(),
+             direct_feed: DirectFeed::default(),
++            balance: DirectBalance::default(),
+         }
+     }
+ 
+@@ -2877,4 +3032,174 @@ mod tests {
+         assert_eq!(render(EAR_RUN + 1), one_at_a_time, "a run and one sample");
+         assert_eq!(render(40), one_at_a_time, "live-sized blocks");
+     }
++
++    // ── Direct balance: HRTF share, level match, zone offsets ──────────────
++
++    /// Unit direction at azimuth `az` (degrees, + right) and elevation `el`.
++    fn dir(az: f64, el: f64) -> [f64; 3] {
++        let (a, e) = (az.to_radians(), el.to_radians());
++        [a.sin() * e.cos(), a.cos() * e.cos(), e.sin()]
++    }
++
++    /// `dry_params` with `balance`, and no ITD: a fractional delay would
++    /// take energy off an impulse and hide what the balance does.
++    fn balanced(balance: DirectBalance) -> BinauralFrameParams {
++        BinauralFrameParams {
++            head_radius_m: 0.0,
++            balance,
++            ..dry_params()
++        }
++    }
++
++    /// Interleaved output of an impulse at `pos` through `params`, after a
++    /// silent block that runs the kernel crossfade out (see `render_single`).
++    fn impulse_out(params: &BinauralFrameParams, pos: [f64; 3]) -> Vec<f32> {
++        let mut r = BinauralRenderer::new(48_000);
++        let n = 512;
++        let mut warm = vec![0.0f32; n * 2];
++        r.render_frame(
++            &vec![0.0f32; n],
++            1,
++            n,
++            params,
++            &[pos],
++            &[ChannelGain::flat(1.0)],
++            &[],
++            None,
++            &mut warm,
++        );
++        let mut input = vec![0.0f32; n];
++        input[0] = 1.0;
++        let mut out = vec![0.0f32; n * 2];
++        r.render_frame(
++            &input,
++            1,
++            n,
++            params,
++            &[pos],
++            &[ChannelGain::flat(1.0)],
++            &[],
++            None,
++            &mut out,
++        );
++        out
++    }
++
++    /// Energy of the left and the right ear in `out`.
++    fn ear_energy(out: &[f32]) -> (f32, f32) {
++        let l = out.iter().step_by(2).map(|v| v * v).sum();
++        let r = out.iter().skip(1).step_by(2).map(|v| v * v).sum();
++        (l, r)
++    }
++
++    #[test]
++    fn zone_weights_of_the_bed_directions() {
++        let cases = [
++            (dir(0.0, 0.0), [1.0, 0.0, 0.0]),
++            (dir(-30.0, 0.0), [0.0, 0.0, 0.0]),
++            ([-1.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
++            (dir(-90.0, 0.0), [0.0, 1.0, 0.0]),
++            (dir(-150.0, 0.0), [0.0, 1.0, 0.0]),
++            (dir(30.0, 45.0), [0.0, 0.0, 1.0]),
++            (dir(135.0, 30.0), [0.0, 1.0, 1.0]),
++            (dir(15.0, 0.0), [0.5, 0.0, 0.0]),
++            (dir(67.5, 0.0), [0.0, 0.5, 0.0]),
++            ([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
++        ];
++        for (pos, want) in cases {
++            let got = zone_weights(pos);
++            assert!(
++                got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-4),
++                "{pos:?}: {got:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn pan_gains_hold_constant_power() {
++        let (l, r) = pan_gains(0.0);
++        assert!((l - DIRECT_EAR_GAIN).abs() < 1e-6, "{l}");
++        assert!((r - DIRECT_EAR_GAIN).abs() < 1e-6, "{r}");
++        assert_eq!(pan_gains(0.5), (0.0, 1.0));
++        assert_eq!(pan_gains(-0.9), (1.0, 0.0));
++        for lat in [-0.4f32, -0.2, 0.1, 0.3] {
++            let (l, r) = pan_gains(lat);
++            assert!((l * l + r * r - 1.0).abs() < 1e-5, "{lat}");
++            assert!(((r - l) / (r + l) - 2.0 * lat).abs() < 1e-5, "{lat}");
++        }
++    }
++
++    #[test]
++    fn hrtf_share_zero_pans_without_the_hrtf() {
++        let params = balanced(DirectBalance {
++            hrtf_share: 0.0,
++            ..Default::default()
++        });
++        let (l, r) = ear_energy(&impulse_out(&params, [0.0, 1.0, 0.0]));
++        assert!((l - 0.5).abs() < 1e-5 && (r - 0.5).abs() < 1e-5, "{l} {r}");
++        let (l, r) = ear_energy(&impulse_out(&params, [-1.0, 0.0, 0.0]));
++        assert!((l - 1.0).abs() < 1e-5 && r < 1e-9, "{l} {r}");
++    }
++
++    #[test]
++    fn hrtf_share_blends_the_two_renders() {
++        let share = |s: f32| {
++            balanced(DirectBalance {
++                hrtf_share: s,
++                ..Default::default()
++            })
++        };
++        let pos = [0.5, 1.0, 0.0];
++        let full = impulse_out(&share(1.0), pos);
++        let pan = impulse_out(&share(0.0), pos);
++        let mix = impulse_out(&share(0.15), pos);
++        for (i, ((m, f), p)) in mix.iter().zip(&full).zip(&pan).enumerate() {
++            assert!((m - (0.15 * f + 0.85 * p)).abs() < 1e-6, "sample {i}");
++        }
++    }
++
++    #[test]
++    fn zone_gains_scale_the_sources_in_their_zone() {
++        let trimmed = balanced(DirectBalance {
++            zone_gains_db: [6.0, -6.0, 3.0],
++            ..Default::default()
++        });
++        let plain = balanced(DirectBalance::default());
++        let change_db = |pos: [f64; 3]| {
++            let (l0, r0) = ear_energy(&impulse_out(&plain, pos));
++            let (l1, r1) = ear_energy(&impulse_out(&trimmed, pos));
++            10.0 * ((l1 + r1) / (l0 + r0)).log10()
++        };
++        for (pos, want) in [
++            (dir(0.0, 0.0), 6.0),
++            (dir(-90.0, 0.0), -6.0),
++            (dir(-30.0, 0.0), 0.0),
++            (dir(30.0, 45.0), 3.0),
++        ] {
++            let db = change_db(pos);
++            assert!((db - want).abs() < 0.01, "{pos:?}: {db}");
++        }
++    }
++
++    #[test]
++    fn direction_normalize_levels_every_direction_to_the_front() {
++        let params = balanced(DirectBalance {
++            normalize: true,
++            ..Default::default()
++        });
++        let energy = |pos: [f64; 3]| {
++            let (l, r) = ear_energy(&impulse_out(&params, pos));
++            l + r
++        };
++        let front = energy(dir(30.0, 0.0));
++        for pos in [
++            dir(0.0, 0.0),
++            dir(-90.0, 0.0),
++            dir(-150.0, 0.0),
++            dir(45.0, 45.0),
++        ] {
++            let db = 10.0 * (energy(pos) / front).log10();
++            assert!(db.abs() < 0.01, "{pos:?}: {db}");
++        }
++    }
+ }
+diff --git a/omniphony-renderer/renderer/src/config.rs b/omniphony-renderer/renderer/src/config.rs
+index b6e1db8..5668078 100644
+--- a/omniphony-renderer/renderer/src/config.rs
++++ b/omniphony-renderer/renderer/src/config.rs
+@@ -433,6 +433,18 @@ pub struct BinauralConfig {
+     /// Low-pass corner of a direct bus (the LFE) in Hz. Default unset.
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub lfe_lowpass_hz: Option<u32>,
++    /// Share of the HRTF render in the direct path's sources, 0 to 1; the
++    /// rest is amplitude-panned. Default 1.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub hrtf_share: Option<f32>,
++    /// Match every direction's HRIR pair to the front pair's energy. Default
++    /// false.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub direction_normalize: Option<bool>,
++    /// Offsets in dB of the centre, surround and height zones. Default
++    /// `[0, 0, 0]`.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub zone_gains_db: Option<[f32; 3]>,
+     /// HRIR data set: `"synthetic"`, `"saf"`/`"kemar"` (embedded measured, default),
+     /// or `"sofa"` (uses `hrtf_sofa_path`; needs the `sofa` build feature).
+     #[serde(skip_serializing_if = "Option::is_none")]
+diff --git a/omniphony-renderer/renderer/src/live_params.rs b/omniphony-renderer/renderer/src/live_params.rs
+index 221c413..58b2787 100644
+--- a/omniphony-renderer/renderer/src/live_params.rs
++++ b/omniphony-renderer/renderer/src/live_params.rs
+@@ -633,6 +633,13 @@ pub struct BinauralLiveParams {
+     pub lfe_gain_db: f32,
+     /// Low-pass corner of a direct bus in Hz; `None` leaves it full band.
+     pub lfe_lowpass_hz: Option<u32>,
++    /// Share of the HRTF render in the direct path's sources, 0 to 1; the
++    /// rest is amplitude-panned (see `binaural::DirectBalance`).
++    pub hrtf_share: f32,
++    /// Match every direction's HRIR pair to the front pair's energy.
++    pub direction_normalize: bool,
++    /// Offsets in dB of the centre, surround and height zones.
++    pub zone_gains_db: [f32; 3],
+     /// Current (smoothed) head orientation applied to world positions. Updated by
+     /// the head-tracking input or set directly via the `head/*` OSC controls.
+     pub head_pose: crate::binaural::HeadPose,
+@@ -683,6 +690,9 @@ impl Default for BinauralLiveParams {
+             head_radius_m: crate::binaural::itd::DEFAULT_HEAD_RADIUS_M,
+             lfe_gain_db: crate::binaural::DIRECT_EAR_GAIN_DB,
+             lfe_lowpass_hz: None,
++            hrtf_share: 1.0,
++            direction_normalize: false,
++            zone_gains_db: [0.0; 3],
+             head_pose: crate::binaural::HeadPose::identity(),
+             tracking: crate::binaural::HeadTracking::default(),
+             hrir_source: crate::binaural::HrirSource::default(),
+diff --git a/omniphony-renderer/renderer/src/options.rs b/omniphony-renderer/renderer/src/options.rs
+index 4a0e52d..ac9a457 100644
+--- a/omniphony-renderer/renderer/src/options.rs
++++ b/omniphony-renderer/renderer/src/options.rs
+@@ -928,6 +928,17 @@ const LFE_GAIN_KIND: OptionKind = OptionKind::Float {
+     step: 0.1,
+ };
+ const LFE_LOWPASS_KIND: OptionKind = OptionKind::OptionalInt { min: 20, max: 500 };
++const HRTF_SHARE_KIND: OptionKind = OptionKind::Float {
++    min: 0.0,
++    max: 1.0,
++    step: 0.01,
++};
++const ZONE_GAINS_KIND: OptionKind = OptionKind::FloatArray {
++    len: 3,
++    min: -24.0,
++    max: 24.0,
++    step: 0.1,
++};
+ const UNIT_LEVEL_KIND: OptionKind = OptionKind::Float {
+     min: 0.0,
+     max: 1.0,
+@@ -2379,6 +2390,82 @@ const HAND_WIRED_ROWS: &[OptionSpec] = &[
+             }
+         },
+     },
++    OptionSpec {
++        key: "binaural_hrtf_share",
++        kind: HRTF_SHARE_KIND,
++        default: OptionDefault::Float(1.0),
++        flags: OptionFlags::NONE,
++        group: None,
++        i18n_key: "binaural.hrtfShare",
++        help_i18n_key: Some("help.binaural.hrtfShare"),
++        legacy_control_addr: LegacyAddr::None,
++        set: |live, raw, _env| {
++            let v = raw_float(raw, HRTF_SHARE_KIND)?;
++            live.binaural.hrtf_share = v;
++            Some(format!("{v}"))
++        },
++        get_json: |live| live.binaural.hrtf_share.into(),
++        config_store: |render, live, _env| {
++            binaural_cfg_mut(render).hrtf_share = Some(live.binaural.hrtf_share);
++        },
++        config_seed: |live, render, _env| {
++            if let Some(v) = binaural_cfg(render).and_then(|b| b.hrtf_share)
++                && v.is_finite()
++            {
++                live.binaural.hrtf_share = clamp_to(HRTF_SHARE_KIND, v);
++            }
++        },
++    },
++    OptionSpec {
++        key: "binaural_direction_normalize",
++        kind: OptionKind::Bool,
++        default: OptionDefault::Bool(false),
++        flags: OptionFlags::NONE,
++        group: None,
++        i18n_key: "binaural.directionNormalize",
++        help_i18n_key: Some("help.binaural.directionNormalize"),
++        legacy_control_addr: LegacyAddr::None,
++        set: |live, raw, _env| {
++            let enabled = raw_bool(raw)?;
++            live.binaural.direction_normalize = enabled;
++            Some(bool_canonical(enabled))
++        },
++        get_json: |live| live.binaural.direction_normalize.into(),
++        config_store: |render, live, _env| {
++            binaural_cfg_mut(render).direction_normalize = Some(live.binaural.direction_normalize);
++        },
++        config_seed: |live, render, _env| {
++            if let Some(v) = binaural_cfg(render).and_then(|b| b.direction_normalize) {
++                live.binaural.direction_normalize = v;
++            }
++        },
++    },
++    OptionSpec {
++        key: "binaural_zone_gains_db",
++        kind: ZONE_GAINS_KIND,
++        default: OptionDefault::FloatArray(&[0.0, 0.0, 0.0]),
++        flags: OptionFlags::NONE,
++        group: None,
++        i18n_key: "binaural.zoneGainsDb",
++        help_i18n_key: Some("help.binaural.zoneGainsDb"),
++        legacy_control_addr: LegacyAddr::None,
++        set: |live, raw, _env| {
++            let gains = raw_floats::<3>(raw, ZONE_GAINS_KIND)?;
++            live.binaural.zone_gains_db = gains;
++            Some(format!("{},{},{}", gains[0], gains[1], gains[2]))
++        },
++        get_json: |live| serde_json::json!(live.binaural.zone_gains_db),
++        config_store: |render, live, _env| {
++            binaural_cfg_mut(render).zone_gains_db = Some(live.binaural.zone_gains_db);
++        },
++        config_seed: |live, render, _env| {
++            if let Some(gains) = binaural_cfg(render).and_then(|b| b.zone_gains_db)
++                && gains.iter().all(|g| g.is_finite())
++            {
++                live.binaural.zone_gains_db = gains.map(|g| clamp_to(ZONE_GAINS_KIND, g));
++            }
++        },
++    },
+     OptionSpec {
+         key: "binaural_air_absorption",
+         kind: OptionKind::Bool,
+@@ -3923,6 +4010,66 @@ mod tests {
+         assert_eq!(seeded.binaural.lfe_lowpass_hz, None);
+     }
+ 
++    #[test]
++    fn binaural_hrtf_share_round_trips_through_config() {
++        let env = OptionEnv::detached();
++        let spec = find("binaural_hrtf_share").expect("binaural_hrtf_share is declared");
++        let mut live = LiveParams::default();
++        assert_eq!(live.binaural.hrtf_share, 1.0);
++        assert!((spec.set)(&mut live, &RawOptionValue::Number(0.15), &env).is_some());
++        assert_eq!(live.binaural.hrtf_share, 0.15);
++        let mut render = RenderConfig::default();
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.hrtf_share),
++            Some(0.15)
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert_eq!(seeded.binaural.hrtf_share, 0.15);
++    }
++
++    #[test]
++    fn binaural_direction_normalize_round_trips_through_config() {
++        let env = OptionEnv::detached();
++        let spec =
++            find("binaural_direction_normalize").expect("binaural_direction_normalize is declared");
++        let mut live = LiveParams::default();
++        assert!(!live.binaural.direction_normalize);
++        assert!((spec.set)(&mut live, &RawOptionValue::Bool(true), &env).is_some());
++        assert!(live.binaural.direction_normalize);
++        let mut render = RenderConfig::default();
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.direction_normalize),
++            Some(true)
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert!(seeded.binaural.direction_normalize);
++    }
++
++    #[test]
++    fn binaural_zone_gains_db_round_trips_through_config() {
++        let env = OptionEnv::detached();
++        let spec = find("binaural_zone_gains_db").expect("binaural_zone_gains_db is declared");
++        let mut live = LiveParams::default();
++        assert_eq!(live.binaural.zone_gains_db, [0.0; 3]);
++        let raw = RawOptionValue::Numbers(&[2.0, -4.5, -3.0]);
++        assert!((spec.set)(&mut live, &raw, &env).is_some());
++        assert_eq!(live.binaural.zone_gains_db, [2.0, -4.5, -3.0]);
++        assert_eq!((spec.get_json)(&live), serde_json::json!([2.0, -4.5, -3.0]));
++        let mut render = RenderConfig::default();
++        (spec.config_store)(&mut render, &live, &env);
++        assert_eq!(
++            render.binaural.as_ref().and_then(|b| b.zone_gains_db),
++            Some([2.0, -4.5, -3.0])
++        );
++        let mut seeded = LiveParams::default();
++        (spec.config_seed)(&mut seeded, &render, &env);
++        assert_eq!(seeded.binaural.zone_gains_db, [2.0, -4.5, -3.0]);
++    }
++
+     /// A bare `sofa` / `brir` reopens the file last named for it, and the
+     /// config keeps both files whatever the selector in force: a room
+     /// response left for KEMAR, saved, and chosen again plays the same file.
+diff --git a/omniphony-renderer/renderer/src/spatial_renderer/mod.rs b/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
+index 36b999a..966cc5a 100644
+--- a/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
++++ b/omniphony-renderer/renderer/src/spatial_renderer/mod.rs
+@@ -1007,6 +1007,11 @@ impl SpatialRenderer {
+                             g.binaural.lfe_gain_db,
+                             g.binaural.lfe_lowpass_hz,
+                         ),
++                        balance: crate::binaural::DirectBalance {
++                            hrtf_share: g.binaural.hrtf_share,
++                            normalize: g.binaural.direction_normalize,
++                            zone_gains_db: g.binaural.zone_gains_db,
++                        },
+                     },
+                     g.binaural.ears,
+                     g.binaural.reads_on_sphere(),
+diff --git a/omniphony-renderer/runtime_control/tests/live_options_conformance.rs b/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
+index 1ca6aa0..5d5ed3a 100644
+--- a/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
++++ b/omniphony-renderer/runtime_control/tests/live_options_conformance.rs
+@@ -368,6 +368,10 @@ mod registry {
+             ("binaural_unit_scale_m", RawOptionValue::Number(2.0)),
+             ("binaural_head_radius_m", RawOptionValue::Number(0.09)),
+             ("binaural_lfe_lowpass_hz", RawOptionValue::Number(120.0)),
++            (
++                "binaural_zone_gains_db",
++                RawOptionValue::Numbers(&[3.0, -3.0, -6.0]),
++            ),
+             ("binaural_air_absorption", RawOptionValue::Bool(false)),
+             ("binaural_diffuse_field_eq", RawOptionValue::Bool(true)),
+             ("binaural_sphere_coordinates", RawOptionValue::Bool(true)),
+diff --git a/omniphony-studio-egui/i18n/en.json b/omniphony-studio-egui/i18n/en.json
+index 415a87e..9968b70 100644
+--- a/omniphony-studio-egui/i18n/en.json
++++ b/omniphony-studio-egui/i18n/en.json
+@@ -127,6 +127,9 @@
+   "help.binaural.headRadius": "Radius of the listener's head in centimetres. Sets the interaural time/level differences; match your own head for sharper localization (average ≈ 8.75 cm).",
+   "help.binaural.lfeGainDb": "Gain of the LFE, and of any other channel that bypasses the HRTF, into each ear (dB). The default, -3.01 dB, splits it between the ears at constant power.",
+   "help.binaural.lfeLowpassHz": "Corner frequency of a 4th-order Linkwitz-Riley low-pass on the LFE and the other channels that bypass the HRTF (Hz). Unset: no filter.",
++  "help.binaural.hrtfShare": "Share of the HRTF render in each source's direct sound, 0 to 1; the rest is amplitude-panned between the ears. 1 renders through the HRTF alone. Direct path only.",
++  "help.binaural.directionNormalize": "Scale each direction's HRIR pair to the energy of the pair at 30° to the front, so that every direction reaches the ears at one power. Direct path only.",
++  "help.binaural.zoneGainsDb": "Level offsets of the centre, surround and height zones (dB), applied to each source in proportion to how far it sits in each zone. Direct path only.",
+   "help.binaural.pinnaPreset": "Per-listener D_n preset from Brown & Duda (1998), Table I — the only parameter the model individualizes. PB & NH and RD are the published subject fits; pick whichever localizes elevation best for you.",
+   "help.binaural.pinnaDScale": "Fine scale on the elevation factor D_n: how strongly the pinna notches move with elevation. 100% is the chosen preset as published; raise/lower to sharpen or soften the vertical effect.",
+   "help.binaural.pinnaDepth": "Strength of the parametric pinna echoes. 0% is the bare head-shadow model (≈ Synthetic, no elevation cue); 100% is full pinna colouration that adds the elevation and front/back cues.",
+@@ -806,6 +809,9 @@
+   "binaural.headRadius": "Head radius (cm)",
+   "binaural.lfeGainDb": "LFE gain (dB)",
+   "binaural.lfeLowpassHz": "LFE low-pass (Hz)",
++  "binaural.hrtfShare": "HRTF share",
++  "binaural.directionNormalize": "Match every direction to the front level",
++  "binaural.zoneGainsDb": "Centre, surround and height offsets (dB)",
+   "binaural.pinnaPreset": "Pinna preset (D)",
+   "binaural.pinnaPreset.pbnh": "PB & NH",
+   "binaural.pinnaPreset.rd": "RD",

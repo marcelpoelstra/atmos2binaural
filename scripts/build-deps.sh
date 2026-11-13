@@ -52,6 +52,7 @@ if [[ "$rev" != 353e135fa01e181bea36d83099a5951fd5c34180 ]]; then
     exit 1
 fi
 git -C "$omniphony" apply "$root/patches/omniphony-v0.7.0-binaural-lfe.patch"
+git -C "$omniphony" apply "$root/patches/omniphony-v0.7.0-binaural-balance.patch"
 (cd "$omniphony/omniphony-renderer" && cargo build --release --locked --target-dir target)
 cp "$omniphony/omniphony-renderer/target/release/orender" "$deps/bin/"
 
