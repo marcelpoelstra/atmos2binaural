@@ -16,6 +16,13 @@ from typing import NamedTuple, Optional
 
 LFE_GAIN_DB = 5.5
 LFE_LOWPASS_HZ = 120
+# Per preset: share of the HRTF render (the rest amplitude-panned), whether
+# every direction is matched to the front level, and the centre, surround and
+# height offsets in dB.
+PRESETS = {
+    "dolby": (0.15, False, (0.0, 0.0, 0.0)),
+    "fold-down": (1.0, True, (0.0, -3.0, 0.0)),
+}
 CEILING_DBTP = -1.0
 TMP_DIR_NAME = ".atmos2binaural-tmp"
 MOUNT_ENV = "ATMOS2BINAURAL_MOUNT"
@@ -73,6 +80,20 @@ def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
         default="synthetic",
         help="head model: synthetic (default) or the measured KEMAR head",
     )
+    parser.add_argument(
+        "--preset",
+        choices=tuple(PRESETS),
+        default="dolby",
+        help="level balance: dolby (default) or fold-down",
+    )
+    for zone in ("centre", "surround", "height"):
+        parser.add_argument(
+            f"--{zone}",
+            type=float,
+            default=0.0,
+            metavar="DB",
+            help=f"add DB to the {zone} on top of the preset (default 0)",
+        )
     parser.add_argument(
         "--allow-damaged",
         action="store_true",
@@ -177,7 +198,16 @@ def check_stream(track: Path) -> list[str]:
     return [line for line in stderr.splitlines() if DAMAGE_PATTERN.search(line)]
 
 
-def orender_command(track: Path, f32: Path, tmp: Path, hrtf: str = "synthetic") -> list[str]:
+def orender_command(
+    track: Path,
+    f32: Path,
+    tmp: Path,
+    hrtf: str = "synthetic",
+    preset: str = "dolby",
+    levels: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> list[str]:
+    share, normalize, offsets = PRESETS[preset]
+    zones = ",".join(f"{a + b:g}" for a, b in zip(offsets, levels))
     return [
         str(DEPS / "bin" / "orender"), "render", str(track),
         "--config", str(tmp / "orender.yaml"),
@@ -185,6 +215,8 @@ def orender_command(track: Path, f32: Path, tmp: Path, hrtf: str = "synthetic") 
         "--output-mode", "binaural", "--hrir-source", hrtf,
         "--output-backend", "file", "--output-file", str(f32), "--output-file-format", "raw_f32",
         "--binaural-lfe-gain-db", str(LFE_GAIN_DB), "--binaural-lfe-lowpass-hz", str(LFE_LOWPASS_HZ),
+        "--binaural-hrtf-share", f"{share:g}", "--binaural-zone-gains-db", zones,
+        *(["--binaural-direction-normalize"] if normalize else []),
         "--loglevel", "warn",
     ]
 
@@ -193,9 +225,16 @@ def find_error_lines(stderr: str) -> list[str]:
     return [line for line in stderr.splitlines() if ERROR_LINE.match(line)]
 
 
-def render(track: Path, f32: Path, tmp: Path, hrtf: str = "synthetic") -> list[str]:
+def render(
+    track: Path,
+    f32: Path,
+    tmp: Path,
+    hrtf: str = "synthetic",
+    preset: str = "dolby",
+    levels: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> list[str]:
     """Render `track` to the float file `f32`; returns orender's ERROR lines."""
-    return find_error_lines(run(orender_command(track, f32, tmp, hrtf)).stderr)
+    return find_error_lines(run(orender_command(track, f32, tmp, hrtf, preset, levels)).stderr)
 
 
 def ebur128(inputs: list[str], filters: str = "ebur128=peak=true") -> Measurement:
@@ -265,7 +304,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                 raise ConversionError(f"{track}: damaged stream: {damage[0]}")
             f32 = tmp / f"{n}.f32"
             started = time.monotonic()
-            errors = render(track, f32, tmp, args.hrtf)
+            errors = render(
+                track, f32, tmp, args.hrtf, args.preset, (args.centre, args.surround, args.height)
+            )
             seconds = time.monotonic() - started
             if errors and not args.allow_damaged:
                 raise ConversionError(f"{track}: damaged stream: {errors[0]}")

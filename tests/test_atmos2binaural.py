@@ -159,9 +159,18 @@ class ArgumentTests(unittest.TestCase):
         self.assertIsNone(args.output)
         self.assertIs(args.allow_damaged, False)
         self.assertEqual(args.hrtf, "synthetic")
+        self.assertEqual(args.preset, "dolby")
+        self.assertEqual((args.centre, args.surround, args.height), (0.0, 0.0, 0.0))
 
     def test_parse_args_hrtf_kemar(self):
         self.assertEqual(a2b.parse_args(["--hrtf", "kemar", "a.thd"]).hrtf, "kemar")
+
+    def test_parse_args_preset_and_levels(self):
+        args = a2b.parse_args(
+            ["--preset", "fold-down", "--centre", "2", "--surround", "-1.5", "--height", "-3", "a.thd"]
+        )
+        self.assertEqual(args.preset, "fold-down")
+        self.assertEqual((args.centre, args.surround, args.height), (2.0, -1.5, -3.0))
 
     def test_parse_args_allow_damaged(self):
         args = a2b.parse_args(["--allow-damaged", "a.thd"])
@@ -183,6 +192,7 @@ class CommandTests(unittest.TestCase):
                 "--output-mode", "binaural", "--hrir-source", "synthetic",
                 "--output-backend", "file", "--output-file", "/o/tmp/1.f32", "--output-file-format", "raw_f32",
                 "--binaural-lfe-gain-db", "5.5", "--binaural-lfe-lowpass-hz", "120",
+                "--binaural-hrtf-share", "0.15", "--binaural-zone-gains-db", "0,0,0",
                 "--loglevel", "warn",
             ],
         )
@@ -190,6 +200,21 @@ class CommandTests(unittest.TestCase):
     def test_orender_command_takes_kemar(self):
         command = a2b.orender_command(Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "kemar")
         self.assertEqual(command[command.index("--hrir-source") + 1], "kemar")
+
+    def test_orender_command_fold_down_adds_the_levels(self):
+        command = a2b.orender_command(
+            Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "fold-down", (2.0, -1.5, -3.0)
+        )
+        self.assertEqual(command[command.index("--binaural-hrtf-share") + 1], "1")
+        self.assertIn("--binaural-direction-normalize", command)
+        self.assertEqual(command[command.index("--binaural-zone-gains-db") + 1], "2,-4.5,-3")
+
+    def test_orender_command_dolby_keeps_the_directions_as_they_are(self):
+        command = a2b.orender_command(
+            Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "dolby", (1.0, 0.0, 0.0)
+        )
+        self.assertNotIn("--binaural-direction-normalize", command)
+        self.assertEqual(command[command.index("--binaural-zone-gains-db") + 1], "1,0,0")
 
     def test_harletty_command_matches_design(self):
         with mock.patch.object(a2b, "DEPS", Path("/d/deps")):
