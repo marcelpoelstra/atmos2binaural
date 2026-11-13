@@ -10,9 +10,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 LFE_GAIN_DB = 5.5
 LFE_LOWPASS_HZ = 120
@@ -30,6 +31,9 @@ DEPS = Path(__file__).resolve().parent / "deps"
 PLUGIN = "libharletty_dolby_bridge.dylib" if sys.platform == "darwin" else "libharletty_dolby_bridge.so"
 DAMAGE_PATTERN = re.compile(r"Parity check failed|could not be decoded|Parse error|ERROR")
 ERROR_LINE = re.compile(r"^\[\S+ ERROR\b")
+# Share in percent of the time a track takes per stage, measured on a 279 s
+# Atmos track on 13-11-2026.
+STAGES = {"checking": 20, "rendering": 45, "measuring": 5, "measuring source": 20, "encoding": 10}
 
 
 class ConversionError(Exception):
@@ -46,24 +50,86 @@ class Measurement(NamedTuple):
     loudness_lufs: float
 
 
-def run(command: list[str]) -> subprocess.CompletedProcess:
-    """Run `command` without a shell; a non-zero exit raises ConversionError
-    with the command and its error output."""
+def run(
+    command: list[str], feed: Optional[Path] = None, progress: Optional[Callable[[float], None]] = None
+) -> subprocess.CompletedProcess:
+    """Run `command` without a shell. A non-zero exit raises ConversionError
+    with the command and its error output. The file `feed` goes to the
+    command's standard input, and `progress` gets the share sent so far."""
+    shown = shlex.join(command) + (f" < {shlex.quote(str(feed))}" if feed else "")
     try:
-        done = subprocess.run(
-            command,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+            with subprocess.Popen(
+                command, stdin=subprocess.PIPE if feed else subprocess.DEVNULL, stdout=out, stderr=err
+            ) as process:
+                if feed:
+                    send(feed, process.stdin, progress)
+            out.seek(0)
+            err.seek(0)
+            done = subprocess.CompletedProcess(
+                command, process.returncode, out.read().decode(errors="replace"), err.read().decode(errors="replace")
+            )
     except OSError as e:
-        raise ConversionError(f"{shlex.join(command)}: {e}") from e
+        raise ConversionError(f"{shown}: {e}") from e
     if done.returncode != 0:
-        raise ConversionError(
-            f"{shlex.join(command)} exited with status {done.returncode}:\n{done.stderr.strip()}"
-        )
+        raise ConversionError(f"{shown} exited with status {done.returncode}:\n{done.stderr.strip()}")
     return done
+
+
+def send(path: Path, pipe, progress: Optional[Callable[[float], None]]) -> None:
+    """Write the file at `path` to `pipe` in chunks and close it."""
+    size = path.stat().st_size or 1
+    sent = 0
+    try:
+        with path.open("rb") as f, pipe:
+            while chunk := f.read(1 << 20):
+                pipe.write(chunk)
+                sent += len(chunk)
+                if progress:
+                    progress(sent / size)
+    except BrokenPipeError:
+        pass  # The command stopped reading, and its exit status says why.
+
+
+class TrackBar:
+    """The progress bar of one track while stdout is a terminal: it fills over
+    the stages in STAGES. Without a terminal only the closing line is printed."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.live = sys.stdout.isatty()
+        self.done = 0
+        self.shown: Optional[tuple[int, str]] = None
+
+    def stage(self, name: str) -> Callable[[float], None]:
+        start, weight = self.done, STAGES[name]
+        self.done += weight
+
+        def show(share: float) -> None:
+            percent = int(start + weight * share)
+            if not self.live or self.shown == (percent, name):
+                return
+            self.shown = (percent, name)
+            columns = shutil.get_terminal_size().columns
+            width = max(10, min(30, columns // 3))
+            filled = width * percent // 100
+            tail = f" {'█' * filled}{'░' * (width - filled)} {percent:3d}% {name}"
+            sys.stdout.write(f"\r\x1b[K{self.label[:max(0, columns - 1 - len(tail))]}{tail}")
+            sys.stdout.flush()
+
+        show(0.0)
+        return show
+
+    def close(self, line: str) -> None:
+        """Replace the bar with the closing line of the track."""
+        if self.live:
+            sys.stdout.write("\r\x1b[K")
+        print(line, flush=True)
+
+    def stop(self) -> None:
+        """Keep the bar of a failed track, so the error starts on a new line."""
+        if self.shown:
+            print(flush=True)
 
 
 def parse_args(argv: Optional[list[str]]) -> argparse.Namespace:
@@ -188,18 +254,17 @@ def probe(track: Path) -> Probe:
     return Probe(codec, rate)
 
 
-def harletty_command(track: Path) -> list[str]:
-    return [str(DEPS / "bin" / "harletty"), "--loglevel", "warn", "decode", str(track)]
+def harletty_command() -> list[str]:
+    return [str(DEPS / "bin" / "harletty"), "--loglevel", "warn", "decode", "-"]
 
 
-def check_stream(track: Path) -> list[str]:
+def check_stream(track: Path, progress: Optional[Callable[[float], None]] = None) -> list[str]:
     """The damage lines the decoder reports for `track`."""
-    stderr = run(harletty_command(track)).stderr
+    stderr = run(harletty_command(), track, progress).stderr
     return [line for line in stderr.splitlines() if DAMAGE_PATTERN.search(line)]
 
 
 def orender_command(
-    track: Path,
     f32: Path,
     tmp: Path,
     hrtf: str = "synthetic",
@@ -209,7 +274,7 @@ def orender_command(
     share, normalize, offsets = PRESETS[preset]
     zones = ",".join(f"{a + b:g}" for a, b in zip(offsets, levels))
     return [
-        str(DEPS / "bin" / "orender"), "render", str(track),
+        str(DEPS / "bin" / "orender"), "render", "-",
         "--config", str(tmp / "orender.yaml"),
         "--bridge-path", str(DEPS / "lib" / PLUGIN),
         "--output-mode", "binaural", "--hrir-source", hrtf,
@@ -232,38 +297,46 @@ def render(
     hrtf: str = "synthetic",
     preset: str = "dolby",
     levels: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    progress: Optional[Callable[[float], None]] = None,
 ) -> list[str]:
     """Render `track` to the float file `f32`; returns orender's ERROR lines."""
-    return find_error_lines(run(orender_command(track, f32, tmp, hrtf, preset, levels)).stderr)
+    return find_error_lines(run(orender_command(f32, tmp, hrtf, preset, levels), track, progress).stderr)
 
 
-def ebur128(inputs: list[str], filters: str = "ebur128=peak=true") -> Measurement:
-    stderr = run(["ffmpeg", "-hide_banner", "-nostats", *inputs, "-af", filters, "-f", "null", "-"]).stderr
+def ebur128(
+    source: Path,
+    input_format: list[str],
+    filters: str = "ebur128=peak=true",
+    progress: Optional[Callable[[float], None]] = None,
+) -> Measurement:
+    command = ["ffmpeg", "-hide_banner", "-nostats", *input_format, "-i", "pipe:0", "-af", filters, "-f", "null", "-"]
+    stderr = run(command, source, progress).stderr
     summary = stderr[stderr.rfind("Summary:"):]
     loudness = re.search(r"^\s+I:\s+(-?[\d.]+) LUFS", summary, re.M)
     peak = re.search(r"^\s+Peak:\s+(-?[\d.]+|-inf) dBFS", summary, re.M)
     if "Summary:" not in stderr or not loudness or not peak:
-        raise ConversionError(f"{inputs[-1]}: no loudness summary from ffmpeg ebur128:\n{stderr.strip()}")
+        raise ConversionError(f"{source}: no loudness summary from ffmpeg ebur128:\n{stderr.strip()}")
     return Measurement(float(peak.group(1)), float(loudness.group(1)))
 
 
-def measure(f32: Path, sample_rate: int) -> Measurement:
-    return ebur128(["-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo", "-i", str(f32)])
+def measure(f32: Path, sample_rate: int, progress: Optional[Callable[[float], None]] = None) -> Measurement:
+    return ebur128(f32, ["-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo"], progress=progress)
 
 
-def playback_loudness(track: Path) -> float:
+def playback_loudness(track: Path, progress: Optional[Callable[[float], None]] = None) -> float:
     """Integrated loudness of `track` as a stereo player plays it: FFmpeg's
     stereo downmix, which is also what mpv, and with it IINA, outputs."""
-    return ebur128(["-i", str(track)], "aformat=channel_layouts=stereo,ebur128=peak=true").loudness_lufs
+    filters = "aformat=channel_layouts=stereo,ebur128=peak=true"
+    return ebur128(track, ["-f", "truehd"], filters, progress).loudness_lufs
 
 
-def encode_command(f32: Path, sample_rate: int, gain_db: float, fmt: str, dest: Path) -> list[str]:
+def encode_command(sample_rate: int, gain_db: float, fmt: str, dest: Path) -> list[str]:
     codec = ["-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24"] if fmt == "flac" else ["-c:a", "pcm_s24le"]
     # The limiter runs at four times the rate, so it holds true peaks, not only samples, to the ceiling.
     limit = 10 ** (CEILING_DBTP / 20)
     return [
         "ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", str(sample_rate), "-ch_layout", "stereo",
-        "-i", str(f32),
+        "-i", "pipe:0",
         "-af", f"volume={gain_db:.4f}dB:precision=float,aresample={4 * sample_rate},"
         f"alimiter=limit={limit:.6f}:level=false:latency=true,aresample={sample_rate}",
         *codec,
@@ -271,13 +344,20 @@ def encode_command(f32: Path, sample_rate: int, gain_db: float, fmt: str, dest: 
     ]
 
 
-def encode(f32: Path, sample_rate: int, gain_db: float, fmt: str, dest: Path) -> None:
-    run(encode_command(f32, sample_rate, gain_db, fmt, dest))
+def encode(
+    f32: Path,
+    sample_rate: int,
+    gain_db: float,
+    fmt: str,
+    dest: Path,
+    progress: Optional[Callable[[float], None]] = None,
+) -> None:
+    run(encode_command(sample_rate, gain_db, fmt, dest), f32, progress)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
-    out_dir = tmp = None
+    out_dir = tmp = bar = None
     created = done = False
     mount = os.environ.get(MOUNT_ENV)
     try:
@@ -295,54 +375,46 @@ def main(argv: Optional[list[str]] = None) -> int:
             shutil.rmtree(tmp)
         tmp.mkdir()
 
-        rendered = []
         damaged = 0
         for n, track in enumerate(tracks, 1):
+            bar = TrackBar(f"{n}/{len(tracks)} {track.stem}")
             rate = probe(track).sample_rate
-            damage = check_stream(track)
+            damage = check_stream(track, bar.stage("checking"))
             if damage and not args.allow_damaged:
                 raise ConversionError(f"{track}: damaged stream: {damage[0]}")
             f32 = tmp / f"{n}.f32"
             started = time.monotonic()
             errors = render(
-                track, f32, tmp, args.hrtf, args.preset, (args.centre, args.surround, args.height)
+                track, f32, tmp, args.hrtf, args.preset, (args.centre, args.surround, args.height),
+                bar.stage("rendering"),
             )
             seconds = time.monotonic() - started
             if errors and not args.allow_damaged:
                 raise ConversionError(f"{track}: damaged stream: {errors[0]}")
             damage += errors
-            loudness = measure(f32, rate).loudness_lufs
-            source = playback_loudness(track)
+            loudness = measure(f32, rate, bar.stage("measuring")).loudness_lufs
+            source = playback_loudness(track, bar.stage("measuring source"))
             gain = source - loudness
+            dest = tmp / output_name(track, args.format)
+            encode(f32, rate, gain, args.format, dest, bar.stage("encoding"))
+            f32.unlink()
+            os.replace(dest, out_dir / dest.name)
             line = (
                 f"{n}/{len(tracks)} {track.stem}: {seconds:.1f} s, {source:.1f} LUFS, gain {gain:+.1f} dB"
             )
             if damage:
                 damaged += 1
                 line += f", damaged: {damage[0]}"
-            print(line, flush=True)
-            rendered.append((track, f32, rate, gain))
+            bar.close(line)
+            bar = None
 
         if damaged:
             print(f"damaged tracks: {damaged}")
-        encoded = []
-        for track, f32, rate, gain in rendered:
-            dest = tmp / output_name(track, args.format)
-            encode(f32, rate, gain, args.format, dest)
-            f32.unlink()
-            encoded.append(dest)
-        moved = []
-        try:
-            for dest in encoded:
-                os.replace(dest, out_dir / dest.name)
-                moved.append(out_dir / dest.name)
-        except OSError:
-            for path in moved:
-                path.unlink()
-            raise
         done = True
         return 0
     except (ConversionError, OSError) as e:
+        if bar:
+            bar.stop()
         print(f"atmos2binaural: {e}", file=sys.stderr)
         return 1
     finally:
