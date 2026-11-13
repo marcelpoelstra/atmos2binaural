@@ -69,6 +69,30 @@ class TempDirTestCase(unittest.TestCase):
         return path
 
 
+class RunTests(TempDirTestCase):
+    def test_run_feeds_the_file_and_reports_progress(self):
+        data = self.tmp / "data.bin"
+        data.write_bytes(os.urandom(3 * 1024 * 1024 + 5))
+        shares = []
+        done = a2b.run(
+            [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"], data, shares.append
+        )
+        self.assertEqual(done.stdout.strip(), str(data.stat().st_size))
+        self.assertEqual(shares, sorted(shares))
+        self.assertEqual(shares[-1], 1.0)
+
+    def test_run_names_the_fed_file_when_the_command_stops_early(self):
+        data = self.tmp / "data.bin"
+        data.write_bytes(bytes(4 * 1024 * 1024))
+        with self.assertRaisesRegex(a2b.ConversionError, r"data\.bin exited with status 3"):
+            a2b.run([sys.executable, "-c", "import sys; sys.exit(3)"], data)
+
+
+class FakeTerminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
 class InputTests(TempDirTestCase):
     def test_collect_inputs_folder_in_name_order(self):
         for name in ("album/b.thd", "album/a.thd", "album/c.txt", "album/sub/d.thd"):
@@ -182,11 +206,11 @@ class CommandTests(unittest.TestCase):
         deps = Path("/d/deps")
         plugin = "libharletty_dolby_bridge.dylib" if sys.platform == "darwin" else "libharletty_dolby_bridge.so"
         with mock.patch.object(a2b, "DEPS", deps):
-            command = a2b.orender_command(Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"))
+            command = a2b.orender_command(Path("/o/tmp/1.f32"), Path("/o/tmp"))
         self.assertEqual(
             command,
             [
-                "/d/deps/bin/orender", "render", "/a/t.thd",
+                "/d/deps/bin/orender", "render", "-",
                 "--config", "/o/tmp/orender.yaml",
                 "--bridge-path", f"/d/deps/lib/{plugin}",
                 "--output-mode", "binaural", "--hrir-source", "synthetic",
@@ -198,12 +222,12 @@ class CommandTests(unittest.TestCase):
         )
 
     def test_orender_command_takes_kemar(self):
-        command = a2b.orender_command(Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "kemar")
+        command = a2b.orender_command(Path("/o/tmp/1.f32"), Path("/o/tmp"), "kemar")
         self.assertEqual(command[command.index("--hrir-source") + 1], "kemar")
 
     def test_orender_command_fold_down_adds_the_levels(self):
         command = a2b.orender_command(
-            Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "fold-down", (2.0, -1.5, -3.0)
+            Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "fold-down", (2.0, -1.5, -3.0)
         )
         self.assertEqual(command[command.index("--binaural-hrtf-share") + 1], "1")
         self.assertIn("--binaural-direction-normalize", command)
@@ -211,15 +235,15 @@ class CommandTests(unittest.TestCase):
 
     def test_orender_command_dolby_keeps_the_directions_as_they_are(self):
         command = a2b.orender_command(
-            Path("/a/t.thd"), Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "dolby", (1.0, 0.0, 0.0)
+            Path("/o/tmp/1.f32"), Path("/o/tmp"), "synthetic", "dolby", (1.0, 0.0, 0.0)
         )
         self.assertNotIn("--binaural-direction-normalize", command)
         self.assertEqual(command[command.index("--binaural-zone-gains-db") + 1], "1,0,0")
 
     def test_harletty_command_matches_design(self):
         with mock.patch.object(a2b, "DEPS", Path("/d/deps")):
-            command = a2b.harletty_command(Path("/a/t.thd"))
-        self.assertEqual(command, ["/d/deps/bin/harletty", "--loglevel", "warn", "decode", "/a/t.thd"])
+            command = a2b.harletty_command()
+        self.assertEqual(command, ["/d/deps/bin/harletty", "--loglevel", "warn", "decode", "-"])
 
     def test_find_error_lines(self):
         error = "[2026-11-07T17:24:06Z ERROR harletty-bridge::diag] Parse error at frame 20445"
@@ -264,7 +288,7 @@ class RenderTests(TempDirTestCase):
         line = "[2026-11-07T17:24:06Z ERROR harletty-bridge::diag] Parse error at frame 20445"
         deps = fake_deps(self.tmp, line)
         with mock.patch.object(a2b, "DEPS", deps):
-            errors = a2b.render(self.tmp / "t.thd", self.tmp / "t.f32", self.tmp)
+            errors = a2b.render(self.touch("t.thd"), self.tmp / "t.f32", self.tmp)
         self.assertEqual(errors, [line])
 
 
@@ -305,12 +329,12 @@ class LevelTests(TempDirTestCase):
 
 class EncodeCommandTests(unittest.TestCase):
     def test_encode_command_flac_24(self):
-        command = a2b.encode_command(Path("/o/tmp/1.f32"), 48000, -10.3, "flac", Path("/o/tmp/t.flac"))
+        command = a2b.encode_command(48000, -10.3, "flac", Path("/o/tmp/t.flac"))
         self.assertEqual(
             command,
             [
                 "ffmpeg", "-v", "error", "-y", "-f", "f32le", "-ar", "48000", "-ch_layout", "stereo",
-                "-i", "/o/tmp/1.f32",
+                "-i", "pipe:0",
                 "-af", "volume=-10.3000dB:precision=float,aresample=192000,"
                 "alimiter=limit=0.891251:level=false:latency=true,aresample=48000",
                 "-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24",
@@ -319,7 +343,7 @@ class EncodeCommandTests(unittest.TestCase):
         )
 
     def test_encode_command_wav_24(self):
-        command = a2b.encode_command(Path("/o/tmp/1.f32"), 48000, -10.3, "wav", Path("/o/tmp/t.wav"))
+        command = a2b.encode_command(48000, -10.3, "wav", Path("/o/tmp/t.wav"))
         self.assertEqual(command[-3:], ["-c:a", "pcm_s24le", "/o/tmp/t.wav"])
 
 
@@ -348,8 +372,8 @@ class ConversionTests(TempDirTestCase):
     def outputs(self, pattern="*.flac"):
         return sorted(p.name for p in self.out.glob(pattern))
 
-    def assert_no_outputs(self):
-        self.assertEqual(self.outputs("*.flac"), [])
+    def assert_finished(self, names):
+        self.assertEqual(self.outputs("*.flac"), names)
         self.assertFalse((self.out / a2b.TMP_DIR_NAME).exists())
 
     @needs_deps
@@ -369,6 +393,45 @@ class ConversionTests(TempDirTestCase):
             loudness, peak = levels(self.out / name)
             self.assertAlmostEqual(loudness, a2b.playback_loudness(self.src / f"{name[:-5]}.thd"), delta=0.3)
             self.assertLessEqual(peak, -1.0)
+
+    @needs_deps
+    def test_each_track_is_written_when_it_is_done(self):
+        make_truehd(self.src / "a.thd")
+        make_truehd(self.src / "b.thd")
+        real = a2b.render
+        seen = []
+
+        def render(track, *args):
+            seen.append(self.outputs())
+            return real(track, *args)
+
+        with mock.patch.object(a2b, "render", render):
+            code, _, err = self.run_main(self.src, "-o", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, [[], ["a.flac"]])
+
+    @needs_deps
+    def test_terminal_shows_a_bar_per_track(self):
+        make_truehd(self.src / "a.thd")
+        make_truehd(self.src / "b.thd")
+        out = FakeTerminal()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = a2b.main([str(self.src), "-o", str(self.out)])
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        for n, name in ((1, "a"), (2, "b")):
+            self.assertRegex(text, rf"\r\x1b\[K{n}/2 {name} [█░]+ +0% checking")
+            self.assertRegex(text, rf"\r\x1b\[K{n}/2 {name} █+ 100% encoding")
+            self.assertRegex(text, rf"\r\x1b\[K{n}/2 {name}: [\d.]+ s, -?[\d.]+ LUFS, gain [-+][\d.]+ dB\n")
+
+    @needs_deps
+    def test_no_terminal_prints_one_line_per_track(self):
+        make_truehd(self.src / "a.thd")
+        make_truehd(self.src / "b.thd")
+        code, out, err = self.run_main(self.src, "-o", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("\r", out)
+        self.assertEqual([line.split(":")[0] for line in out.splitlines()], ["1/2 a", "2/2 b"])
 
     @needs_deps
     def test_convert_wav(self):
@@ -397,7 +460,7 @@ class ConversionTests(TempDirTestCase):
         self.assertTrue((self.src / "a.flac").exists() and (self.src / "b.flac").exists())
 
     @needs_deps
-    def test_failed_render_leaves_no_outputs(self):
+    def test_failed_render_keeps_the_finished_track(self):
         make_truehd(self.src / "a.thd")
         make_truehd(self.src / "b.thd")
         real = a2b.render
@@ -412,10 +475,10 @@ class ConversionTests(TempDirTestCase):
         with mock.patch.object(a2b, "render", render):
             code, _, _ = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
 
     @needs_deps
-    def test_failed_encode_leaves_no_outputs(self):
+    def test_failed_encode_keeps_the_finished_track(self):
         make_truehd(self.src / "a.thd")
         make_truehd(self.src / "b.thd")
         real = a2b.encode
@@ -430,7 +493,7 @@ class ConversionTests(TempDirTestCase):
         with mock.patch.object(a2b, "encode", encode):
             code, _, _ = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
 
     @needs_deps
     def test_stale_tmp_folder_is_replaced(self):
@@ -448,7 +511,7 @@ class ConversionTests(TempDirTestCase):
         (self.src / "x.thd").write_text("not audio\n" * 100)
         code, _, _ = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
 
     @needs_deps
     def test_damaged_input_stops_the_run(self):
@@ -456,7 +519,7 @@ class ConversionTests(TempDirTestCase):
         damage(make_truehd(self.src / "b.thd"))
         code, _, err = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
         self.assertIn("b.thd", err)
 
     ERROR_LINE = "[2026-11-07T17:24:06Z ERROR harletty-bridge::diag] Parse error at frame 20445"
@@ -476,7 +539,7 @@ class ConversionTests(TempDirTestCase):
         with mock.patch.object(a2b, "render", self.render_with_error_on("b.thd")):
             code, _, err = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
         self.assertIn("b.thd", err)
         self.assertIn(self.ERROR_LINE, err)
 
@@ -492,7 +555,7 @@ class ConversionTests(TempDirTestCase):
         self.assertIn("damaged tracks: 1", out)
 
     @needs_deps
-    def test_failed_move_leaves_no_outputs(self):
+    def test_failed_move_keeps_the_finished_track(self):
         make_truehd(self.src / "a.thd")
         make_truehd(self.src / "b.thd")
         real = os.replace
@@ -507,7 +570,7 @@ class ConversionTests(TempDirTestCase):
         with mock.patch.object(a2b.os, "replace", replace):
             code, _, err = self.run_main(self.src, "-o", self.out)
         self.assertEqual(code, 1)
-        self.assert_no_outputs()
+        self.assert_finished(["a.flac"])
         self.assertIn("disk full", err)
 
     @needs_deps

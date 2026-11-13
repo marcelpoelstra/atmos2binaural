@@ -100,7 +100,10 @@ In the `atmos2binaural` folder, convert an album by giving its folder:
 ./atmos2binaural.py "/Music/My Atmos Album"
 ```
 
-This creates the folder `/Music/My Atmos Album (binaural)/` with one FLAC or WAV file per track, named after the original files.
+This creates the folder `/Music/My Atmos Album (binaural)/` with one FLAC or WAV file per track, named after the original files. 
+Each track is written to that folder as soon as it is done. 
+In a terminal, a progress bar shows how far the current track is. 
+Without a terminal, e.g. in a log file, you get one line per finished track.
 
 You can also give single `.thd` files, or several files and folders at once. 
 From a folder, atmos2binaural takes the `.thd` files directly inside it, it does not search subfolders. 
@@ -194,7 +197,7 @@ atmos2binaural writes 24-bit FLAC or WAV files at the sample rate of the source.
 Each track plays as loud as its TrueHD file does in a stereo player such as IINA. 
 A limiter keeps the peaks at or below -1 dBTP. The LFE (subwoofer) channel is included, in both ears.
 
-Existing files with the same name are overwritten. A run that fails writes no files. Tags and cover art are not copied.
+Existing files with the same name are overwritten. A run that fails keeps the tracks it finished. Tags and cover art are not copied.
 
 ## Damaged files
 
